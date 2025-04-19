@@ -9,11 +9,14 @@
 
 RWTH Aachen University, ETH AI Center
 
-Interactive 4D segmentation is a new paradigm that segments multiple objects across consecutive LiDAR scans in a single step, improving efficiency and consistency while simplifying tracking and annotation. Interactive4D model supports interactive 4D multi-object segmentation, where a user collaborates with a deep learning model to segment multiple 3D objects simultaneously across multiple scans, by providing interactive clicks.
+## Overview
+
+Interactive4D (ICRA 2025) is an interactive neural model for 4D LiDAR segmentation that jointly segments multiple objects across consecutive LiDAR scans in a single step. It supports interactive 4D multi-object segmentation, where a user collaborates with a deep learning model by providing clicks to segment multiple 3D objects simultaneously across multiple frames—improving efficiency, ensuring consistency, and simplifying tracking and annotation.
 
 <a href="https://pytorch.org/get-started/locally/"><img alt="PyTorch" src="https://img.shields.io/badge/PyTorch-ee4c2c?logo=pytorch&logoColor=white"></a>
 <a href="https://pytorchlightning.ai/"><img alt="Lightning" src="https://img.shields.io/badge/-Lightning-792ee5?logo=pytorchlightning&logoColor=white"></a>
 <a href="https://black.readthedocs.io/en/stable/"><img alt="Code style: black" src="https://img.shields.io/badge/code%20style-black-black.svg"></a>
+<img alt="ICRA 2025" src="https://img.shields.io/badge/ICRA-2025-blue">
 
 ![teaser](./docs/Interactive4d_teaser.gif)
 
@@ -420,11 +423,12 @@ A comprehensive guide to using the tool, including setup and interaction steps, 
 ## BibTeX :scroll:
 
 ```text
-@article      {fradlin2024interactive4d,
+@inproceedings{fradlin2024interactive4d,
   title     = {{Interactive4D: Interactive 4D LiDAR Segmentation}},
   author    = {Fradlin, Ilya and Zulfikar, Idil Esen and Yilmaz, Kadir and Kontogianni, Theodora and Leibe, Bastian},
-  journal   = {arXiv preprint arXiv:2410.08206},
-  year      = {2024}
+  booktitle = {Proceedings of the IEEE International Conference on Robotics and Automation (ICRA)},
+  year      = {2025},
+  note      = {Accepted}
 }
 ```
 
