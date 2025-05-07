@@ -23,6 +23,7 @@ class InteractiveDataLoader:
         self.config = config
         self.dataset_path = config.dataset_scenes
         self.user_point_type = config.point_type
+        self.sweep_size = config.data.datasets.sweep
         self.scene_names = []
         for scene_dir in sorted(os.listdir(self.dataset_path)):
             scene_dir_path = os.path.join(self.dataset_path, scene_dir)
@@ -99,7 +100,11 @@ class InteractiveDataLoader:
             # Accessing and combining the color channels
             self.scene_3dpoints_gt_masks_colors = np.stack((point_cloud["red"], point_cloud["green"], point_cloud["blue"]), axis=-1)
             # Accessing and combining other features
-            self.scene_3dpoints_features = np.stack((point_cloud["time"], point_cloud["intensity"], point_cloud["distance"]), axis=-1)
+            if self.sweep_size == 1: 
+                self.scene_3dpoints_features = np.stack((point_cloud["intensity"], point_cloud["distance"]), axis=-1)
+            else:
+                self.scene_3dpoints_features = np.stack((point_cloud["time"], point_cloud["intensity"], point_cloud["distance"]), axis=-1)
+                
         else:
             raise Exception(f"Data Format of 3d points in '3dpoints.ply' unknown for scene {name}")
 

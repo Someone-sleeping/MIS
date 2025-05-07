@@ -39,6 +39,7 @@ class Interactive4D(nn.Module):
             in_channels = 2
         else:
             in_channels = 3  # scan index is added as an additional feature
+        self.is_cuda_available = torch.cuda.is_available()
         self.sweep_size = sweep_size
         self.backbone = Res16UNet34C(in_channels=in_channels, out_channels=19, config=backbone_cfg)
         self.num_heads = num_heads
@@ -170,8 +171,14 @@ class Interactive4D(nn.Module):
 
         for b in range(batch_size):
 
-            mins = coordinates.decomposed_features[b].min(dim=0)[0].unsqueeze(0)
-            maxs = coordinates.decomposed_features[b].max(dim=0)[0].unsqueeze(0)
+            if self.is_cuda_available:
+                mins = coordinates.decomposed_features[b].min(dim=0)[0].unsqueeze(0)
+                maxs = coordinates.decomposed_features[b].max(dim=0)[0].unsqueeze(0)
+            
+            else:
+                mins = coordinates.F.min(dim=0)[0].unsqueeze(0)
+                maxs = coordinates.F.max(dim=0)[0].unsqueeze(0)
+
 
             click_idx_sample = click_idx[b]
             click_time_idx_sample = click_time_idx[b]
@@ -183,7 +190,10 @@ class Interactive4D(nn.Module):
             fg_query_num_split = [len(click_idx_sample[str(i)]) for i in range(1, fg_obj_num + 1)]
             fg_query_num = sum(fg_query_num_split)
 
-            fg_clicks_coords = torch.vstack([coordinates.decomposed_features[b][click_idx_sample[str(i)], :] for i in range(1, fg_obj_num + 1)]).unsqueeze(0)
+            if self.is_cuda_available:
+                fg_clicks_coords = torch.vstack([coordinates.decomposed_features[b][click_idx_sample[str(i)], :] for i in range(1, fg_obj_num + 1)]).unsqueeze(0)
+            else:
+                fg_clicks_coords = torch.vstack([coordinates.F[click_idx_sample[str(i)], :] for i in range(1, fg_obj_num + 1)]).unsqueeze(0)
             fg_query_pos = self.pos_enc(fg_clicks_coords.float(), input_range=[mins, maxs])
 
             fg_clicks_time_idx = list(itertools.chain.from_iterable([click_time_idx_sample[str(i)] for i in range(1, fg_obj_num + 1)]))
@@ -203,7 +213,10 @@ class Interactive4D(nn.Module):
             fg_query_pos = fg_query_pos + fg_query_time + fg_query_obj
 
             if len(bg_click_idx) != 0:
-                bg_click_coords = coordinates.decomposed_features[b][bg_click_idx].unsqueeze(0)
+                if self.is_cuda_available:
+                    bg_click_coords = coordinates.decomposed_features[b][bg_click_idx].unsqueeze(0)
+                else:
+                    bg_click_coords = coordinates.F[bg_click_idx].unsqueeze(0)
                 bg_query_pos = self.pos_enc(bg_click_coords.float(), input_range=[mins, maxs])  # [num_queries, 128]
                 bg_query_time = self.time_encode[click_time_idx_sample["0"]].T.unsqueeze(0).to(bg_query_pos.device)
                 bg_query_pos = bg_query_pos + bg_query_time
@@ -217,11 +230,17 @@ class Interactive4D(nn.Module):
 
             bg_query_num = bg_query_pos.shape[0]
             # with torch.no_grad():
-            fg_queries = torch.vstack([pcd_features.decomposed_features[b][click_idx_sample[str(i)], :] for i in range(1, fg_obj_num + 1)])
+            if self.is_cuda_available:
+                fg_queries = torch.vstack([pcd_features.decomposed_features[b][click_idx_sample[str(i)], :] for i in range(1, fg_obj_num + 1)])
+            else:
+                fg_queries = torch.vstack([pcd_features.F[click_idx_sample[str(i)], :] for i in range(1, fg_obj_num + 1)])
 
             if len(bg_click_idx) != 0:
                 # with torch.no_grad():
-                bg_queries = pcd_features.decomposed_features[b][bg_click_idx, :]
+                if self.is_cuda_available:
+                    bg_queries = pcd_features.decomposed_features[b][bg_click_idx, :]
+                else:
+                    bg_queries = pcd_features.F[bg_click_idx, :]
                 bg_queries = torch.cat([bg_learn_queries[b], bg_queries], dim=0)
             else:
                 bg_queries = bg_learn_queries[b]
@@ -231,7 +250,10 @@ class Interactive4D(nn.Module):
             bg_query_obj = self.object_embedding(bg_obj_id)
             bg_queries += bg_query_obj
 
-            src_pcd = pcd_features.decomposed_features[b]
+            if self.is_cuda_available:
+                src_pcd = pcd_features.decomposed_features[b]
+            else:
+                src_pcd = pcd_features.F
 
             if self.sweep_size > 1:
                 # Add scan encoding for 4d setup for the attention mechanism
@@ -345,7 +367,11 @@ class Interactive4D(nn.Module):
 
         for i in range(len(coords)):
             pos_encodings_pcd.append([[]])
-            for coords_batch in coords[i].decomposed_features:
+            if self.is_cuda_available:
+                decomposed_features = coords[i].decomposed_features
+            else:
+                decomposed_features = [coords[i].F]
+            for coords_batch in decomposed_features:
                 scene_min = coords_batch.min(dim=0)[0][None, ...]
                 scene_max = coords_batch.max(dim=0)[0][None, ...]
 
