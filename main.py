@@ -51,6 +51,7 @@ def get_parameters(cfg: DictConfig):
     """
     Parse and prepare model parameters, loggers, and configurations.
     """
+    cfg.trainer.detect_anomaly = False
     if cfg.general.debug:
         os.environ["WANDB_MODE"] = "dryrun"
         os.environ["TORCH_DISTRIBUTED_DEBUG"] = "DETAIL"
@@ -134,11 +135,12 @@ def validate(cfg: DictConfig):
     runner = Trainer(
         logger=loggers,
         default_root_dir=cfg.logging.save_dir,
-        devices=1,
-        num_nodes=1,
+        devices=cfg.trainer.num_devices,
+        num_nodes=cfg.trainer.num_nodes,
         accelerator="gpu",
         check_val_every_n_epoch=cfg.trainer.check_val_every_n_epoch,
         limit_val_batches=cfg.trainer.limit_train_batches,
+        strategy="ddp_find_unused_parameters_false",
     )
     runner.validate(model, ckpt_path=cfg.general.ckpt_path)
 
