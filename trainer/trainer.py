@@ -329,16 +329,6 @@ class ObjectSegmentation(pl.LightningModule):
                 pred_logits = outputs["pred_masks"]
                 pred = [p.argmax(-1) for p in pred_logits]
 
-            # if current_num_clicks != 0:
-            #     click_weights = cal_click_loss_weights(batch_indicators, raw_coords, torch.cat(labels), click_idx, self.config.loss.w_min, self.config.loss.w_max, self.config.loss.delta)
-            #     loss_dict = self.criterion(outputs, labels, obj2label, click_weights)
-            #     weight_dict = self.criterion.weight_dict
-            #     losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
-            #
-            #     loss_dict_reduced = utils.reduce_dict(loss_dict)
-            #     loss_dict_reduced_scaled = {k: v * weight_dict[k] for k, v in loss_dict_reduced.items() if k in weight_dict}
-            #     loss_dict_reduced_unscaled = {f"{k}_unscaled": v for k, v in loss_dict_reduced.items()}
-
             updated_pred = []
 
             for idx in range(batch_size):
@@ -475,9 +465,7 @@ class ObjectSegmentation(pl.LightningModule):
 
                 label_miou_dict = {"validation/" + k: v for k, v in label_miou_dict.items()}
                 self.log("validation/quantized_mIoU", general_miou, on_step=True, on_epoch=True, batch_size=batch_size, prog_bar=True)
-                # self.log_dict(label_miou_dict, on_step=False, on_epoch=True, batch_size=batch_size, sync_dist=True)
                 self.validation_metric_logger.update(mIoU_quantized=general_miou)
-                #self.validation_metric_logger.update(loss=sum(loss_dict_reduced_scaled.values()), **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
 
             if current_num_clicks == 0 or average_clicks_per_obj >= 10:
                 new_clicks_num = num_obj[idx]
@@ -485,6 +473,45 @@ class ObjectSegmentation(pl.LightningModule):
                 new_clicks_num = 1
             current_num_clicks += new_clicks_num
 
+
+        if current_num_clicks != 0:
+            # print(f"Rank {self.global_rank} before updating loss", flush=True)
+            click_weights = cal_click_loss_weights(
+                batch_indicators,
+                raw_coords,
+                torch.cat(labels),
+                click_idx,
+                self.config.loss.w_min,
+                self.config.loss.w_max,
+                self.config.loss.delta,
+            )
+            loss_dict = self.criterion(outputs, labels, obj2label, click_weights)
+            weight_dict = self.criterion.weight_dict
+            losses = sum(
+                loss_dict[k] * weight_dict[k]
+                for k in loss_dict.keys()
+                if k in weight_dict
+            )
+            loss_dict_reduced = utils.reduce_dict(loss_dict)
+            loss_dict_reduced_scaled = {
+                k: v * weight_dict[k]
+                for k, v in loss_dict_reduced.items()
+                if k in weight_dict
+            }
+            loss_dict_reduced_unscaled = {
+                f"{k}_unscaled": v for k, v in loss_dict_reduced.items()
+            }
+            # print(f"Rank {self.global_rank} after updating loss", flush=True)
+        else:
+            print(
+                f"Rank {self.global_rank} skipping loss update for 0 clicks", flush=True
+            )
+
+        self.validation_metric_logger.update(
+            loss=sum(loss_dict_reduced_scaled.values()),
+            **loss_dict_reduced_scaled,
+            **loss_dict_reduced_unscaled,
+        )
         pred = 0
 
         # Update NoC@target for all the targets that have not been reached
@@ -620,9 +647,9 @@ class ObjectSegmentation(pl.LightningModule):
             self.log_dict(
                 {
                     "validation/epoch": self.current_epoch,
-                    #"validation/loss_epoch": stats["loss"],
-                    #"validation/loss_bce_epoch": stats["loss_bce"],
-                    #"validation/loss_dice_epoch": stats["loss_dice"],
+                    "validation/loss_epoch": stats["loss"],
+                    "validation/loss_bce_epoch": stats["loss_bce"],
+                    "validation/loss_dice_epoch": stats["loss_dice"],
                     "validation/mIoU_quantized_epoch": stats["mIoU_quantized"],
                     "validation/Interactive_metrics/NoC_50_scene": stats["NoC@50"],
                     "validation/Interactive_metrics/NoC_obj_50_scene": stats["NoC_obj@50"],
@@ -667,9 +694,9 @@ class ObjectSegmentation(pl.LightningModule):
             self.log_dict(
                 {
                     "validation/epoch": self.current_epoch,
-                    #"validation/loss_epoch": stats["loss"],
-                    #"validation/loss_bce_epoch": stats["loss_bce"],
-                    #"validation/loss_dice_epoch": stats["loss_dice"],
+                    "validation/loss_epoch": stats["loss"],
+                    "validation/loss_bce_epoch": stats["loss_bce"],
+                    "validation/loss_dice_epoch": stats["loss_dice"],
                     "validation/mIoU_quantized_epoch": stats["mIoU_quantized"],
                     "validation/Interactive_metrics/NoC_50_scene": stats["NoC@50"],
                     "validation/Interactive_metrics/NoC_obj_50_scene": stats["NoC_obj@50"],
