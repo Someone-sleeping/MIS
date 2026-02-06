@@ -321,6 +321,8 @@ class ObjectSegmentation(pl.LightningModule):
                         continue
                     next_iou_target_indices_obj[idx][sweep_number][obj_id_str] = 0
 
+        loss_dict = None  # Initialize loss_dict to None to aggregate losses over click simulation iterations
+
         while current_num_clicks <= max_num_clicks:
             if current_num_clicks == 0:
                 pred = [torch.zeros(l.shape).to(coords) for l in labels]
@@ -329,6 +331,32 @@ class ObjectSegmentation(pl.LightningModule):
                 pred_logits = outputs["pred_masks"]
                 pred = [p.argmax(-1) for p in pred_logits]
 
+            if current_num_clicks != 0:
+                if loss_dict is None:
+                    click_weights = cal_click_loss_weights(
+                        batch_indicators,
+                        raw_coords,
+                        torch.cat(labels),
+                        click_idx,
+                        self.config.loss.w_min,
+                        self.config.loss.w_max,
+                        self.config.loss.delta,
+                    )
+                    loss_dict = self.criterion(
+                        outputs, labels, obj2label, click_weights
+                    )
+                    loss_dict["iteration_num"] = 1
+
+                else:
+                    loss_dict_agg = self.criterion(
+                        outputs, labels, obj2label, click_weights
+                    )
+                    for key in loss_dict:
+                        if key == "iteration_num":
+                            loss_dict[key] += 1
+                        else:
+                            loss_dict[key] += loss_dict_agg[key]
+                            
             updated_pred = []
 
             for idx in range(batch_size):
@@ -473,26 +501,19 @@ class ObjectSegmentation(pl.LightningModule):
                 new_clicks_num = 1
             current_num_clicks += new_clicks_num
 
-
-        if current_num_clicks != 0:
-            # print(f"Rank {self.global_rank} before updating loss", flush=True)
-            click_weights = cal_click_loss_weights(
-                batch_indicators,
-                raw_coords,
-                torch.cat(labels),
-                click_idx,
-                self.config.loss.w_min,
-                self.config.loss.w_max,
-                self.config.loss.delta,
-            )
-            loss_dict = self.criterion(outputs, labels, obj2label, click_weights)
+        if loss_dict is not None and "iteration_num" in loss_dict:
+            # Extract iteration_num before reducing
+            iteration_num = loss_dict["iteration_num"]
+            
+            # Create a copy without iteration_num for reduction
+            loss_dict_for_reduction = {k: v for k, v in loss_dict.items() if k != "iteration_num"}
+            
+            # Average the losses by iteration_num
+            for key in loss_dict_for_reduction:
+                loss_dict_for_reduction[key] = loss_dict_for_reduction[key] / iteration_num
+            
             weight_dict = self.criterion.weight_dict
-            losses = sum(
-                loss_dict[k] * weight_dict[k]
-                for k in loss_dict.keys()
-                if k in weight_dict
-            )
-            loss_dict_reduced = utils.reduce_dict(loss_dict)
+            loss_dict_reduced = utils.reduce_dict(loss_dict_for_reduction)
             loss_dict_reduced_scaled = {
                 k: v * weight_dict[k]
                 for k, v in loss_dict_reduced.items()
@@ -501,17 +522,18 @@ class ObjectSegmentation(pl.LightningModule):
             loss_dict_reduced_unscaled = {
                 f"{k}_unscaled": v for k, v in loss_dict_reduced.items()
             }
+            
+            self.validation_metric_logger.update(
+                loss=sum(loss_dict_reduced_scaled.values()),
+                **loss_dict_reduced_scaled,
+                **loss_dict_reduced_unscaled,
+            )
             # print(f"Rank {self.global_rank} after updating loss", flush=True)
         else:
             print(
-                f"Rank {self.global_rank} skipping loss update for 0 clicks", flush=True
+                f"Rank {self.global_rank} skipping loss averaging - no iteration_num tracked", flush=True
             )
 
-        self.validation_metric_logger.update(
-            loss=sum(loss_dict_reduced_scaled.values()),
-            **loss_dict_reduced_scaled,
-            **loss_dict_reduced_unscaled,
-        )
         pred = 0
 
         # Update NoC@target for all the targets that have not been reached
