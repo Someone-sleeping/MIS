@@ -287,7 +287,10 @@ class ObjectSegmentation(pl.LightningModule):
         for idx in range(batch_size):
             if len(labels[idx].unique()) < 2:
                 # If there is only the background in the scene, skip the scene
-                print("after quantization, only background in the scene")
+                print(
+                    f"EARLY RETURN: after quantization, only background in the scene. Rank: {self.global_rank}, batch_idx: {batch_idx}",
+                    flush=True,
+                )
                 return
 
         ###### interactive evaluation ######
@@ -318,6 +321,8 @@ class ObjectSegmentation(pl.LightningModule):
                         continue
                     next_iou_target_indices_obj[idx][sweep_number][obj_id_str] = 0
 
+        loss_dict = None  # Initialize loss_dict to None to aggregate losses over click simulation iterations
+
         while current_num_clicks <= max_num_clicks:
             if current_num_clicks == 0:
                 pred = [torch.zeros(l.shape).to(coords) for l in labels]
@@ -327,15 +332,31 @@ class ObjectSegmentation(pl.LightningModule):
                 pred = [p.argmax(-1) for p in pred_logits]
 
             if current_num_clicks != 0:
-                click_weights = cal_click_loss_weights(batch_indicators, raw_coords, torch.cat(labels), click_idx, self.config.loss.w_min, self.config.loss.w_max, self.config.loss.delta)
-                loss_dict = self.criterion(outputs, labels, obj2label, click_weights)
-                weight_dict = self.criterion.weight_dict
-                losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
+                if loss_dict is None:
+                    click_weights = cal_click_loss_weights(
+                        batch_indicators,
+                        raw_coords,
+                        torch.cat(labels),
+                        click_idx,
+                        self.config.loss.w_min,
+                        self.config.loss.w_max,
+                        self.config.loss.delta,
+                    )
+                    loss_dict = self.criterion(
+                        outputs, labels, obj2label, click_weights
+                    )
+                    loss_dict["iteration_num"] = 1
 
-                loss_dict_reduced = utils.reduce_dict(loss_dict)
-                loss_dict_reduced_scaled = {k: v * weight_dict[k] for k, v in loss_dict_reduced.items() if k in weight_dict}
-                loss_dict_reduced_unscaled = {f"{k}_unscaled": v for k, v in loss_dict_reduced.items()}
-
+                else:
+                    loss_dict_agg = self.criterion(
+                        outputs, labels, obj2label, click_weights
+                    )
+                    for key in loss_dict:
+                        if key == "iteration_num":
+                            loss_dict[key] += 1
+                        else:
+                            loss_dict[key] += loss_dict_agg[key]
+                            
             updated_pred = []
 
             for idx in range(batch_size):
@@ -472,15 +493,46 @@ class ObjectSegmentation(pl.LightningModule):
 
                 label_miou_dict = {"validation/" + k: v for k, v in label_miou_dict.items()}
                 self.log("validation/quantized_mIoU", general_miou, on_step=True, on_epoch=True, batch_size=batch_size, prog_bar=True)
-                self.log_dict(label_miou_dict, on_step=False, on_epoch=True, batch_size=batch_size, sync_dist=True)
                 self.validation_metric_logger.update(mIoU_quantized=general_miou)
-                self.validation_metric_logger.update(loss=sum(loss_dict_reduced_scaled.values()), **loss_dict_reduced_scaled, **loss_dict_reduced_unscaled)
 
             if current_num_clicks == 0 or average_clicks_per_obj >= 10:
                 new_clicks_num = num_obj[idx]
             else:
                 new_clicks_num = 1
             current_num_clicks += new_clicks_num
+
+        if loss_dict is not None and "iteration_num" in loss_dict:
+            # Extract iteration_num before reducing
+            iteration_num = loss_dict["iteration_num"]
+            
+            # Create a copy without iteration_num for reduction
+            loss_dict_for_reduction = {k: v for k, v in loss_dict.items() if k != "iteration_num"}
+            
+            # Average the losses by iteration_num
+            for key in loss_dict_for_reduction:
+                loss_dict_for_reduction[key] = loss_dict_for_reduction[key] / iteration_num
+            
+            weight_dict = self.criterion.weight_dict
+            loss_dict_reduced = utils.reduce_dict(loss_dict_for_reduction)
+            loss_dict_reduced_scaled = {
+                k: v * weight_dict[k]
+                for k, v in loss_dict_reduced.items()
+                if k in weight_dict
+            }
+            loss_dict_reduced_unscaled = {
+                f"{k}_unscaled": v for k, v in loss_dict_reduced.items()
+            }
+            
+            self.validation_metric_logger.update(
+                loss=sum(loss_dict_reduced_scaled.values()),
+                **loss_dict_reduced_scaled,
+                **loss_dict_reduced_unscaled,
+            )
+            # print(f"Rank {self.global_rank} after updating loss", flush=True)
+        else:
+            print(
+                f"Rank {self.global_rank} skipping loss averaging - no iteration_num tracked", flush=True
+            )
 
         pred = 0
 
@@ -527,9 +579,12 @@ class ObjectSegmentation(pl.LightningModule):
             wandb.log({f"point_scene/prediction_{scene_name}_quantized_iou_{general_miou:.2f}": pred_scene})
 
     def on_validation_epoch_end(self):
-        print("\n")
-        print("--------- Evaluating Validation Performance  -----------")
+        torch.distributed.barrier()
+        if self.global_rank == 0:
+            print("\n")
+            print("--------- Evaluating Validation Performance  -----------")
         warnings.filterwarnings("ignore", message="The ``compute`` method of metric NumClicks_for_IoU was called before the ``update`` method", category=UserWarning)
+        print(f"global_rank {self.global_rank} reached on_validation_epoch_end", flush=True)
         results_dict = {}
         results_dict["mIoU_quantized"] = self.validation_metric_logger.meters["mIoU_quantized"].global_avg
         # Evaluate the NoC@IoU Metric
@@ -699,6 +754,16 @@ class ObjectSegmentation(pl.LightningModule):
             click_of_interest_int = int(click_of_interest)
             self.log_dict({f"validation/Interactive_metrics/Tracking_IoU_{click_of_interest_int}": tmp})
         self.validation_metric_logger = utils.MetricLogger(delimiter="  ")  # reset metric
+
+        self.iou_at_numClicks.reset()
+        self.iou_at_numClicks_weighted.reset()
+        self.numClicks_for_IoU.reset()
+        self.numClicks_for_IoU_obj.reset()
+        self.numClicks_for_IoU_class.reset()
+        for class_type in self.label_mapping.values():
+            self.iou_at_numClicks_class[class_type].reset()
+
+        torch.distributed.barrier()
 
     def pre_interactive_sampling(
         self,
