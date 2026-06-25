@@ -6,6 +6,7 @@ import os
 import numpy as np
 import time
 from interactive_tool.utils import get_obj_color, OBJECT_CLICK_COLOR, BACKGROUND_CLICK_COLOR, UNSELECTED_OBJECTS_COLOR, SELECTED_OBJECT_COLOR, find_nearest
+from interactive_tool.text_prompts import parse_text_prompt
 import torch
 
 
@@ -132,7 +133,11 @@ class InteractiveSegmentationGUI:
             self.interaction_buttons.add_child(button)
             self.interaction_buttons.add_fixed(self.separation_height / 4)
         self.interaction_text = gui.TextEdit()
-        self.interaction_text.text_value = "object"
+        self.interaction_text.text_value = "优化桌子的类别分割"
+        self.add_text_button = gui.Button("Add Text")
+        self.add_text_button.horizontal_padding_em = 0.35
+        self.add_text_button.vertical_padding_em = 0.15
+        self.add_text_button.set_on_clicked(self.__add_text_prompt_for_current_object)
 
         # Run Button
         self.run_seg_button = gui.Button("RUN/SAVE [Enter]")
@@ -191,6 +196,7 @@ class InteractiveSegmentationGUI:
         self.right_side.add_child(self.interaction_mode_label)
         self.right_side.add_child(self.interaction_buttons)
         self.right_side.add_child(self.interaction_text)
+        self.right_side.add_child(self.add_text_button)
         self.right_side.add_fixed(self.separation_height)
         self.right_side.add_child(self.objects_widget)
         self.right_side.add_fixed(self.separation_height)
@@ -309,6 +315,56 @@ class InteractiveSegmentationGUI:
     def __append_interaction_token(self, obj_id, token):
         obj_key = str(obj_id)
         self.interactions.setdefault(obj_key, []).append(token)
+
+    def __build_text_token(self, anchor, extent=None):
+        parsed_prompt = parse_text_prompt(self.interaction_text.text_value)
+        token_text = parsed_prompt.canonical_text
+        return {
+            "type": "text",
+            "indices": [],
+            "anchor": [float(v) for v in anchor],
+            "extent": [float(v) for v in (extent or [0.0, 0.0, 0.0])],
+            "text": token_text,
+            "raw_text": parsed_prompt.raw_text,
+            "target_class": parsed_prompt.target_class,
+            "intent": parsed_prompt.intent,
+            "text_hash": self.__stable_text_hash(token_text),
+            "time": int(self.num_clicks),
+        }
+
+    def __object_prompt_geometry(self, obj_id):
+        obj_key = str(obj_id)
+        positions = self.click_positions.get(obj_key, [])
+        if len(positions) > 0:
+            points = np.asarray(positions, dtype=np.float32)
+            anchor = points.mean(axis=0).astype(float).tolist()
+            extent = (points.max(axis=0) - points.min(axis=0)).astype(float).tolist()
+            return anchor, extent
+
+        obj_mask = self.object_mask[:, 0] == obj_id if self.object_mask is not None else None
+        if obj_mask is not None and np.any(obj_mask):
+            points = self.coordinates[obj_mask]
+            anchor = points.mean(axis=0).astype(float).tolist()
+            extent = (points.max(axis=0) - points.min(axis=0)).astype(float).tolist()
+            return anchor, extent
+
+        anchor = self.coordinates.mean(axis=0).astype(float).tolist()
+        return anchor, [0.0, 0.0, 0.0]
+
+    def __add_text_prompt_for_current_object(self):
+        obj_id = self.objects_widget.current_object_idx
+        if obj_id is None:
+            self.window.show_message_box("Missing Object", "Select or create an object before adding a text prompt.")
+            return
+        anchor, extent = self.__object_prompt_geometry(obj_id)
+        token = self.__build_text_token(anchor=anchor, extent=extent)
+        self.__append_interaction_token(obj_id, token)
+        self.info_coordinate_text = f"Text prompt: {token['raw_text']} -> {token['text']} ({token['intent']})"
+        self.num_clicks += 1
+        gui.Application.instance.post_to_main_thread(self.window, self.__update_click_num)
+        gui.Application.instance.post_to_main_thread(self.window, self.__update_colors)
+        if self.auto_infer:
+            self.__run_segmentation()
 
     def __line_mask(self, start, end):
         start = np.asarray(start, dtype=np.float32)
@@ -579,22 +635,11 @@ class InteractiveSegmentationGUI:
                     self.cur_obj_idx = -1
 
                 elif self.interaction_mode == "text":
-                    text = self.interaction_text.text_value.strip() or self.cur_obj_name or "object"
+                    token = self.__build_text_token(anchor=click_position)
                     self.__append_click_record(obj_id, point_idx, click_position, self.num_clicks)
-                    self.__append_interaction_token(
-                        obj_id,
-                        {
-                            "type": "text",
-                            "indices": [],
-                            "anchor": click_position,
-                            "extent": [0.0, 0.0, 0.0],
-                            "text": text,
-                            "text_hash": self.__stable_text_hash(text),
-                            "time": int(self.num_clicks),
-                        },
-                    )
+                    self.__append_interaction_token(obj_id, token)
                     self.new_colors[segmentation_cube_mask] = get_obj_color(obj_id, normalize=True)
-                    self.info_coordinate_text = f"Text interaction for object {obj_id}: {text}"
+                    self.info_coordinate_text = f"Text interaction for object {obj_id}: {token['raw_text']} -> {token['text']} ({token['intent']})"
                     self.num_clicks += 1
                     if self.auto_infer:
                         self.__run_segmentation()
