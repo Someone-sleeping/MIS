@@ -1,6 +1,7 @@
 import open3d as o3d
 import open3d.visualization.gui as gui  # type: ignore
 import open3d.visualization.rendering as rendering  # type: ignore
+import hashlib
 import os
 import numpy as np
 import time
@@ -77,6 +78,9 @@ class InteractiveSegmentationGUI:
         self.click_idx = {"0": []}
         self.click_time_idx = {"0": []}
         self.click_positions = {"0": []}
+        self.interactions = {"0": []}
+        self.interaction_mode = "click"
+        self.pending_interaction = None
         self.cur_obj_idx = -1
         self.cur_obj_name = None
 
@@ -109,12 +113,26 @@ class InteractiveSegmentationGUI:
         self.objects_widget = Objects(spacing=0, app=self, margin=standard_margin, font=font, separation_height=self.separation_height, em=self.em)
         self.objects_widget.update_buttons()
 
-        self.click_info = gui.Label("Number of Click: 0")  # only visible if at least one object available
+        self.click_info = gui.Label("Number of Interactions: 0")  # only visible if at least one object available
         self.click_info.text_color = gui.Color(1.0, 0.5, 0.0)
         self.click_info.font_id = font
 
         self.auto_checkbox = gui.Checkbox("Infer automatically when clicking")
         self.auto_checkbox.set_on_checked(self.__on_cb)  # set the callback function
+
+        self.interaction_mode_label = gui.Label("Interaction: click")
+        self.interaction_mode_label.text_color = gui.Color(1.0, 0.5, 0.0)
+        self.interaction_mode_label.font_id = font
+        self.interaction_buttons = gui.Horiz(0, zero_margin)
+        for mode_name in ["click", "line", "box", "text"]:
+            button = gui.Button(mode_name)
+            button.horizontal_padding_em = 0.35
+            button.vertical_padding_em = 0.15
+            button.set_on_clicked(lambda mode=mode_name: self.__set_interaction_mode(mode))
+            self.interaction_buttons.add_child(button)
+            self.interaction_buttons.add_fixed(self.separation_height / 4)
+        self.interaction_text = gui.TextEdit()
+        self.interaction_text.text_value = "object"
 
         # Run Button
         self.run_seg_button = gui.Button("RUN/SAVE [Enter]")
@@ -170,6 +188,10 @@ class InteractiveSegmentationGUI:
         self.right_side.add_fixed(self.separation_height)
         self.right_side.add_child(self.auto_checkbox)
         self.right_side.add_fixed(self.separation_height)
+        self.right_side.add_child(self.interaction_mode_label)
+        self.right_side.add_child(self.interaction_buttons)
+        self.right_side.add_child(self.interaction_text)
+        self.right_side.add_fixed(self.separation_height)
         self.right_side.add_child(self.objects_widget)
         self.right_side.add_fixed(self.separation_height)
         self.right_side.add_child(self.click_info)
@@ -222,7 +244,12 @@ class InteractiveSegmentationGUI:
     def __run_segmentation(self):
         """Button "Segment" or ENTER pressed by User"""
         if self.vis_mode_semantics:
-            self.model.get_next_click(click_idx=self.click_idx, click_time_idx=self.click_time_idx, click_positions=self.click_positions, num_clicks=self.num_clicks, run_model=True, gt_labels=self.new_labels, ori_coords=self.coordinates, scene_name=self.curr_scene_name)
+            interactions = {obj_id: tokens for obj_id, tokens in self.interactions.items() if obj_id == "0" or len(tokens) > 0}
+            has_foreground = any(obj_id != "0" and len(tokens) > 0 for obj_id, tokens in interactions.items())
+            if not has_foreground:
+                self.window.show_message_box("Missing Interaction", "Add at least one completed foreground interaction first.")
+                return
+            self.model.get_next_click(click_idx=self.click_idx, click_time_idx=self.click_time_idx, click_positions=self.click_positions, interactions=interactions, num_clicks=self.num_clicks, run_model=True, gt_labels=self.new_labels, ori_coords=self.coordinates, scene_name=self.curr_scene_name)
         else:
             self.window.show_message_box("Toggle Object Colors/Semantics", "Please untoggle the scene color with Key <o> first!")
 
@@ -244,6 +271,80 @@ class InteractiveSegmentationGUI:
     def __save_and_quit(self):
         """Button "Save and Quit" pressed by User"""
         self.model.load_next_scene(quit=True)
+
+    def __set_interaction_mode(self, mode):
+        self.interaction_mode = mode
+        self.pending_interaction = None
+        self.interaction_mode_label.text = f"Interaction: {mode}"
+        self.info_coordinate_text = f"Interaction mode set to {mode}"
+        gui.Application.instance.post_to_main_thread(self.window, self.__update_colors)
+
+    @staticmethod
+    def __stable_text_hash(text):
+        return int(hashlib.md5(text.encode("utf-8")).hexdigest()[:8], 16)
+
+    def __ensure_current_object(self, point_idx):
+        current_obj_id = self.objects_widget.objects.get(f"object {self.cur_obj_key}")
+        created = current_obj_id is None
+        if created:
+            self.objects_widget.create_object(cur_obj_key=self.cur_obj_key)
+        else:
+            self.cur_obj_idx = int(current_obj_id)
+        obj_id = int(self.cur_obj_idx)
+        obj_key = str(obj_id)
+        self.click_idx.setdefault(obj_key, [])
+        self.click_time_idx.setdefault(obj_key, [])
+        self.click_positions.setdefault(obj_key, [])
+        self.interactions.setdefault(obj_key, [])
+        if created and self.new_labels is not None:
+            self.new_labels[self.original_labels == self.original_labels_qv[point_idx]] = obj_id
+        return obj_id
+
+    def __append_click_record(self, obj_id, point_idx, click_position, time_idx):
+        obj_key = str(obj_id)
+        self.click_idx.setdefault(obj_key, []).append(int(point_idx))
+        self.click_time_idx.setdefault(obj_key, []).append(int(time_idx))
+        self.click_positions.setdefault(obj_key, []).append(click_position)
+
+    def __append_interaction_token(self, obj_id, token):
+        obj_key = str(obj_id)
+        self.interactions.setdefault(obj_key, []).append(token)
+
+    def __line_mask(self, start, end):
+        start = np.asarray(start, dtype=np.float32)
+        end = np.asarray(end, dtype=np.float32)
+        line = end - start
+        denom = float(np.dot(line, line))
+        if denom <= 1e-8:
+            return np.linalg.norm(self.coordinates - start, axis=1) <= max(self.cube_size, 0.03)
+        rel = self.coordinates - start
+        t = np.clip((rel @ line) / denom, 0.0, 1.0)
+        projection = start + t[:, None] * line
+        threshold = max(self.cube_size * 2.0, 0.04)
+        return np.linalg.norm(self.coordinates - projection, axis=1) <= threshold
+
+    def __box_mask(self, start, end):
+        start = np.asarray(start, dtype=np.float32)
+        end = np.asarray(end, dtype=np.float32)
+        mins = np.minimum(start, end)
+        maxs = np.maximum(start, end)
+        pad = max(self.cube_size, 0.02)
+        return np.all((self.coordinates >= (mins - pad)) & (self.coordinates <= (maxs + pad)), axis=1)
+
+    def __box_indices_qv(self, start, end):
+        coords_qv = self.coordinates_qv.detach().cpu().numpy()
+        start = np.asarray(start, dtype=np.float32)
+        end = np.asarray(end, dtype=np.float32)
+        mins = np.minimum(start, end)
+        maxs = np.maximum(start, end)
+        pad = max(self.cube_size, 0.02)
+        mask = np.all((coords_qv >= (mins - pad)) & (coords_qv <= (maxs + pad)), axis=1)
+        indices = np.where(mask)[0]
+        max_box_points = int(self.model.config.get("interactions", {}).get("max_box_points", 64))
+        if indices.shape[0] > max_box_points:
+            keep = np.linspace(0, indices.shape[0] - 1, max_box_points).astype(np.int64)
+            indices = indices[keep]
+        return indices.tolist()
 
     def __key_event(self, event):
         """Recognizes key events for shortcuts"""
@@ -355,9 +456,17 @@ class InteractiveSegmentationGUI:
                 # Ctrl for background click
                 self.info_coordinate_text = "Selected coordinate ({:.3f}, {:.3f}, {:.3f})".format(point[0], point[1], point[2])
 
-                self.click_idx["0"].append(point_idx)
-                self.click_time_idx["0"].append(self.num_clicks)
-                self.click_positions["0"].append(click_position)
+                self.__append_click_record("0", point_idx, click_position, self.num_clicks)
+                self.__append_interaction_token(
+                    "0",
+                    {
+                        "type": "click",
+                        "indices": [int(point_idx)],
+                        "anchor": click_position,
+                        "extent": [0.0, 0.0, 0.0],
+                        "time": int(self.num_clicks),
+                    },
+                )
 
                 self.new_colors[segmentation_cube_mask] = BACKGROUND_CLICK_COLOR
                 self.num_clicks += 1
@@ -366,39 +475,130 @@ class InteractiveSegmentationGUI:
                     self.__run_segmentation()
 
             else:
-                # Number key for object click
+                # Number key for object interaction
                 self.info_coordinate_text = "Selected coordinate ({:.3f}, {:.3f}, {:.3f})".format(point[0], point[1], point[2])
 
-                # get object index
-                current_obj_id = self.objects_widget.objects.get(f"object {self.cur_obj_key}")
-
-                ### new object
-                if self.click_idx.get(str(current_obj_id)) == None:
-                    self.objects_widget.create_object(cur_obj_key=self.cur_obj_key)
-                    self.click_idx[str(self.cur_obj_idx)] = [point_idx]
-                    self.click_time_idx[str(self.cur_obj_idx)] = [self.num_clicks]
+                obj_id = self.__ensure_current_object(point_idx)
+                if len(self.click_idx[str(obj_id)]) == 0:
                     obj_3d_label = self.widget3d.add_3d_label(point, self.cur_obj_name)
                     self.obj_3d_labels.append(obj_3d_label)
-                    self.click_positions[str(self.cur_obj_idx)] = [click_position]
 
-                    ### compute new GT labels
-                    if self.new_labels is not None:
-                        self.new_labels[self.original_labels == self.original_labels_qv[point_idx]] = self.cur_obj_idx
+                if self.interaction_mode == "click":
+                    self.__append_click_record(obj_id, point_idx, click_position, self.num_clicks)
+                    self.__append_interaction_token(
+                        obj_id,
+                        {
+                            "type": "click",
+                            "indices": [int(point_idx)],
+                            "anchor": click_position,
+                            "extent": [0.0, 0.0, 0.0],
+                            "time": int(self.num_clicks),
+                        },
+                    )
+                    self.new_colors[segmentation_cube_mask] = get_obj_color(obj_id, normalize=True)
+                    self.num_clicks += 1
 
-                ### existing objects
-                else:
-                    self.cur_obj_idx = int(current_obj_id)
-                    self.click_idx[str(self.cur_obj_idx)].append(point_idx)
-                    self.click_time_idx[str(self.cur_obj_idx)].append(self.num_clicks)
-                    self.click_positions[str(self.cur_obj_idx)].append(click_position)
+                    if self.auto_infer:
+                        self.__run_segmentation()
 
-                self.new_colors[segmentation_cube_mask] = get_obj_color(self.cur_obj_idx, normalize=True)
-                self.num_clicks += 1
+                    self.cur_obj_idx = -1
 
-                if self.auto_infer:
-                    self.__run_segmentation()
+                elif self.interaction_mode == "line":
+                    pending = self.pending_interaction
+                    if pending is None or pending["type"] != "line" or pending["obj_id"] != obj_id:
+                        self.pending_interaction = {
+                            "type": "line",
+                            "obj_id": obj_id,
+                            "point_idx": int(point_idx),
+                            "position": click_position,
+                            "point": point,
+                        }
+                        self.new_colors[segmentation_cube_mask] = get_obj_color(obj_id, normalize=True)
+                        self.info_coordinate_text = "Line start selected. Click the end point with the same object key."
+                    else:
+                        start_idx = pending["point_idx"]
+                        start_position = pending["position"]
+                        line_mask = self.__line_mask(start_position, click_position)
+                        self.__append_click_record(obj_id, start_idx, start_position, self.num_clicks)
+                        self.__append_click_record(obj_id, point_idx, click_position, self.num_clicks)
+                        self.__append_interaction_token(
+                            obj_id,
+                            {
+                                "type": "line",
+                                "indices": [int(start_idx), int(point_idx)],
+                                "anchor": ((np.asarray(start_position) + np.asarray(click_position)) / 2.0).astype(float).tolist(),
+                                "extent": np.abs(np.asarray(click_position) - np.asarray(start_position)).astype(float).tolist(),
+                                "time": int(self.num_clicks),
+                            },
+                        )
+                        self.new_colors[line_mask] = get_obj_color(obj_id, normalize=True)
+                        self.pending_interaction = None
+                        self.num_clicks += 1
+                        if self.auto_infer:
+                            self.__run_segmentation()
+                    self.cur_obj_idx = -1
 
-                self.cur_obj_idx = -1
+                elif self.interaction_mode == "box":
+                    pending = self.pending_interaction
+                    if pending is None or pending["type"] != "box" or pending["obj_id"] != obj_id:
+                        self.pending_interaction = {
+                            "type": "box",
+                            "obj_id": obj_id,
+                            "point_idx": int(point_idx),
+                            "position": click_position,
+                            "point": point,
+                        }
+                        self.new_colors[segmentation_cube_mask] = get_obj_color(obj_id, normalize=True)
+                        self.info_coordinate_text = "Box corner selected. Click the opposite corner with the same object key."
+                    else:
+                        start_idx = pending["point_idx"]
+                        start_position = pending["position"]
+                        box_indices = self.__box_indices_qv(start_position, click_position)
+                        if len(box_indices) == 0:
+                            box_indices = [int(start_idx), int(point_idx)]
+                        box_mask = self.__box_mask(start_position, click_position)
+                        anchor = ((np.asarray(start_position) + np.asarray(click_position)) / 2.0).astype(float).tolist()
+                        extent = np.abs(np.asarray(click_position) - np.asarray(start_position)).astype(float).tolist()
+                        self.__append_click_record(obj_id, start_idx, start_position, self.num_clicks)
+                        self.__append_click_record(obj_id, point_idx, click_position, self.num_clicks)
+                        self.__append_interaction_token(
+                            obj_id,
+                            {
+                                "type": "box",
+                                "indices": [int(idx) for idx in box_indices],
+                                "anchor": anchor,
+                                "extent": extent,
+                                "time": int(self.num_clicks),
+                            },
+                        )
+                        self.new_colors[box_mask] = get_obj_color(obj_id, normalize=True)
+                        self.pending_interaction = None
+                        self.num_clicks += 1
+                        if self.auto_infer:
+                            self.__run_segmentation()
+                    self.cur_obj_idx = -1
+
+                elif self.interaction_mode == "text":
+                    text = self.interaction_text.text_value.strip() or self.cur_obj_name or "object"
+                    self.__append_click_record(obj_id, point_idx, click_position, self.num_clicks)
+                    self.__append_interaction_token(
+                        obj_id,
+                        {
+                            "type": "text",
+                            "indices": [],
+                            "anchor": click_position,
+                            "extent": [0.0, 0.0, 0.0],
+                            "text": text,
+                            "text_hash": self.__stable_text_hash(text),
+                            "time": int(self.num_clicks),
+                        },
+                    )
+                    self.new_colors[segmentation_cube_mask] = get_obj_color(obj_id, normalize=True)
+                    self.info_coordinate_text = f"Text interaction for object {obj_id}: {text}"
+                    self.num_clicks += 1
+                    if self.auto_infer:
+                        self.__run_segmentation()
+                    self.cur_obj_idx = -1
 
             gui.Application.instance.post_to_main_thread(self.window, self.__update_click_num)
 
@@ -488,7 +688,7 @@ class InteractiveSegmentationGUI:
         # self.app.run_one_tick() # necessary because sometimes only updates if there is a new movement from the user
 
     def __update_click_num(self):
-        self.click_info.text = f"Number of Click: {str(self.num_clicks)}"
+        self.click_info.text = f"Number of Interactions: {str(self.num_clicks)}"
 
     def __on_cb(self, is_checked):
         if is_checked:
@@ -548,6 +748,9 @@ class InteractiveSegmentationGUI:
 
         self.click_idx = {"0": []}
         self.click_time_idx = {"0": []}
+        self.click_positions = {"0": []}
+        self.interactions = {"0": []}
+        self.pending_interaction = None
 
         self.num_clicks = 0
         self.objects_widget.current_object_idx = None
@@ -560,7 +763,7 @@ class InteractiveSegmentationGUI:
             self.objects_widget.update_buttons()
             self.objects_widget.toggle_info.text = ""
             self.objects_widget.toggle_info.visible = False
-            self.click_info.text = "Number of Click: 0"
+            self.click_info.text = "Number of Interactions: 0"
             for obj_3d_label in self.obj_3d_labels:
                 self.widget3d.remove_3d_label(obj_3d_label)
 
@@ -669,6 +872,9 @@ class UserInstruction(gui.CollapsableVert):
         descr_bg = gui.Label("{: <30}Background".format("[CTRL + Click]"))
         descr_bg.text_color = gui.Color(*BACKGROUND_CLICK_COLOR)
         descr_bg.font_id = font
+        descr_modes = gui.Label("{: <30}click / line / box / text".format("[Mode buttons]"))
+        descr_modes.text_color = gui.Color(0.8, 0.8, 0.8)
+        descr_modes.font_id = font
         descr_unselect = gui.Label("{: <30}Unselect".format("[CTRL + SHIFT + Click]"))
         descr_unselect.text_color = gui.Color(0.8, 0.8, 0.8)
         descr_unselect.font_id = font
@@ -677,6 +883,7 @@ class UserInstruction(gui.CollapsableVert):
         desr_toggle_colors.font_id = font
 
         self.add_child(desr_toggle_colors)
+        self.add_child(descr_modes)
         self.add_child(descr_obj)
         self.add_child(descr_bg)
         # self.add_child(descr_unselect)
@@ -745,7 +952,12 @@ class Objects(gui.CollapsableVert):
 
     def create_object(self, object_name=None, load_colors=False, cur_obj_key=None):
         """Button "Create" pressed by User to create new object or load objects for new scene"""
-        object_name = "object " + str(cur_obj_key)
+        if cur_obj_key is not None:
+            object_name = "object " + str(cur_obj_key)
+        elif object_name is None:
+            object_name = self.object_textfield.text_value.strip()
+            if len(object_name) == 0 or object_name == "- enter name here-":
+                object_name = "object " + str(len(self.objects) + 1)
 
         if object_name not in self.objects:
             self.objects[object_name] = len(self.objects) + 1  # save the associated object id

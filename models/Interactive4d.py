@@ -136,6 +136,14 @@ class Interactive4D(nn.Module):
 
         # Learned object-id embeddings
         self.object_embedding = nn.Embedding(400, hidden_dim)
+        self.interaction_type_to_id = {"click": 0, "line": 1, "box": 2, "text": 3, "learned_bg": 4}
+        self.interaction_type_embedding = nn.Embedding(len(self.interaction_type_to_id), hidden_dim)
+        self.interaction_geometry_mlp = nn.Sequential(
+            nn.Linear(8, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+        )
+        self.text_hash_embedding = nn.Embedding(4096, hidden_dim)
 
     def forward_backbone(self, x, raw_coordinates=None, is_eval=False):
         device = x.device
@@ -160,7 +168,7 @@ class Interactive4D(nn.Module):
 
         return pcd_features, all_features, coordinates, pos_encodings_pcd
 
-    def forward_mask(self, pcd_features, aux, coordinates, pos_encodings_pcd, click_idx=None, click_time_idx=None, scan_numbers=None):
+    def forward_mask(self, pcd_features, aux, coordinates, pos_encodings_pcd, click_idx=None, click_time_idx=None, scan_numbers=None, interactions=None):
 
         batch_size = pcd_features.C[:, 0].max() + 1
 
@@ -179,71 +187,29 @@ class Interactive4D(nn.Module):
                 mins = coordinates.F.min(dim=0)[0].unsqueeze(0)
                 maxs = coordinates.F.max(dim=0)[0].unsqueeze(0)
 
+            if self.is_cuda_available:
+                sample_coords = coordinates.decomposed_features[b]
+                sample_features = pcd_features.decomposed_features[b]
+            else:
+                sample_coords = coordinates.F
+                sample_features = pcd_features.F
 
-            click_idx_sample = click_idx[b]
-            click_time_idx_sample = click_time_idx[b]
+            interactions_sample = None if interactions is None else interactions[b]
+            if interactions_sample is None:
+                interactions_sample = self._legacy_clicks_to_interactions(click_idx[b], click_time_idx[b])
 
-            bg_click_idx = click_idx_sample["0"]
+            fg_queries, fg_query_pos, fg_query_num_split, bg_queries, bg_query_pos = self._build_unified_interaction_queries(
+                interactions_sample=interactions_sample,
+                sample_coords=sample_coords,
+                sample_features=sample_features,
+                mins=mins,
+                maxs=maxs,
+                bg_learn_queries=bg_learn_queries[b],
+                bg_learn_query_pos=bg_learn_query_pos[b],
+            )
 
-            fg_obj_num = len(click_idx_sample.keys()) - 1
-
-            fg_query_num_split = [len(click_idx_sample[str(i)]) for i in range(1, fg_obj_num + 1)]
             fg_query_num = sum(fg_query_num_split)
-
-            if self.is_cuda_available:
-                fg_clicks_coords = torch.vstack([coordinates.decomposed_features[b][click_idx_sample[str(i)], :] for i in range(1, fg_obj_num + 1)]).unsqueeze(0)
-            else:
-                fg_clicks_coords = torch.vstack([coordinates.F[click_idx_sample[str(i)], :] for i in range(1, fg_obj_num + 1)]).unsqueeze(0)
-            fg_query_pos = self.pos_enc(fg_clicks_coords.float(), input_range=[mins, maxs])
-
-            fg_clicks_time_idx = list(itertools.chain.from_iterable([click_time_idx_sample[str(i)] for i in range(1, fg_obj_num + 1)]))
-            # clip the time index to 1999
-            fg_clicks_time_idx = [1999 if x >= 2000 else x for x in fg_clicks_time_idx]
-            fg_query_time = self.time_encode[fg_clicks_time_idx].T.unsqueeze(0).to(fg_query_pos.device)
-
-            # generate obj_id embeddings
-            current_obj_id = 1
-            obj_id_list = []
-            for count in fg_query_num_split:
-                obj_id_list.extend([current_obj_id] * count)
-                current_obj_id += 1
-            obj_id_tensor = torch.tensor(obj_id_list, dtype=torch.long).to(fg_query_pos.device)
-
-            fg_query_obj = self.object_embedding(obj_id_tensor).T.unsqueeze(0)
-            fg_query_pos = fg_query_pos + fg_query_time + fg_query_obj
-
-            if len(bg_click_idx) != 0:
-                if self.is_cuda_available:
-                    bg_click_coords = coordinates.decomposed_features[b][bg_click_idx].unsqueeze(0)
-                else:
-                    bg_click_coords = coordinates.F[bg_click_idx].unsqueeze(0)
-                bg_query_pos = self.pos_enc(bg_click_coords.float(), input_range=[mins, maxs])  # [num_queries, 128]
-                bg_query_time = self.time_encode[click_time_idx_sample["0"]].T.unsqueeze(0).to(bg_query_pos.device)
-                bg_query_pos = bg_query_pos + bg_query_time
-
-                bg_query_pos = torch.cat([bg_learn_query_pos[b].T.unsqueeze(0), bg_query_pos], dim=-1)
-            else:
-                bg_query_pos = bg_learn_query_pos[b].T.unsqueeze(0)
-
-            fg_query_pos = fg_query_pos.permute((2, 0, 1))[:, 0, :]  # [num_queries, 128]
-            bg_query_pos = bg_query_pos.permute((2, 0, 1))[:, 0, :]  # [num_queries, 128]
-
             bg_query_num = bg_query_pos.shape[0]
-            # with torch.no_grad():
-            if self.is_cuda_available:
-                fg_queries = torch.vstack([pcd_features.decomposed_features[b][click_idx_sample[str(i)], :] for i in range(1, fg_obj_num + 1)])
-            else:
-                fg_queries = torch.vstack([pcd_features.F[click_idx_sample[str(i)], :] for i in range(1, fg_obj_num + 1)])
-
-            if len(bg_click_idx) != 0:
-                # with torch.no_grad():
-                if self.is_cuda_available:
-                    bg_queries = pcd_features.decomposed_features[b][bg_click_idx, :]
-                else:
-                    bg_queries = pcd_features.F[bg_click_idx, :]
-                bg_queries = torch.cat([bg_learn_queries[b], bg_queries], dim=0)
-            else:
-                bg_queries = bg_learn_queries[b]
 
             # generate bg (obj 0) obj embedding
             bg_obj_id = torch.zeros(bg_queries.shape[0], dtype=torch.long, device=bg_query_pos.device)
@@ -314,6 +280,136 @@ class Interactive4D(nn.Module):
             out["aux_outputs"] = self._set_aux_loss(predictions_mask)
 
         return out
+
+    def _legacy_clicks_to_interactions(self, click_idx_sample, click_time_idx_sample):
+        interactions = {}
+        for obj_id, point_indices in click_idx_sample.items():
+            interactions[obj_id] = []
+            for local_idx, point_idx in enumerate(point_indices):
+                times = click_time_idx_sample.get(obj_id, [])
+                time_idx = times[local_idx] if local_idx < len(times) else local_idx
+                interactions[obj_id].append(
+                    {
+                        "type": "click",
+                        "indices": [int(point_idx)],
+                        "time": int(time_idx),
+                    }
+                )
+        return interactions
+
+    def _build_unified_interaction_queries(
+        self,
+        interactions_sample,
+        sample_coords,
+        sample_features,
+        mins,
+        maxs,
+        bg_learn_queries,
+        bg_learn_query_pos,
+    ):
+        device = sample_features.device
+        fg_queries = []
+        fg_query_pos = []
+        fg_query_num_split = []
+
+        fg_obj_ids = sorted([int(obj_id) for obj_id in interactions_sample.keys() if int(obj_id) != 0])
+        for obj_id in fg_obj_ids:
+            obj_tokens = interactions_sample.get(str(obj_id), [])
+            obj_query, obj_pos = self._encode_interaction_tokens(
+                tokens=obj_tokens,
+                obj_id=obj_id,
+                sample_coords=sample_coords,
+                sample_features=sample_features,
+                mins=mins,
+                maxs=maxs,
+            )
+            fg_queries.append(obj_query)
+            fg_query_pos.append(obj_pos)
+            fg_query_num_split.append(obj_query.shape[0])
+
+        if len(fg_queries) == 0:
+            raise ValueError("Interactive4D requires at least one foreground interaction token.")
+
+        fg_queries = torch.cat(fg_queries, dim=0)
+        fg_query_pos = torch.cat(fg_query_pos, dim=0)
+
+        bg_tokens = interactions_sample.get("0", [])
+        if len(bg_tokens) > 0:
+            bg_token_queries, bg_token_pos = self._encode_interaction_tokens(
+                tokens=bg_tokens,
+                obj_id=0,
+                sample_coords=sample_coords,
+                sample_features=sample_features,
+                mins=mins,
+                maxs=maxs,
+            )
+            bg_queries = torch.cat([bg_learn_queries, bg_token_queries], dim=0)
+            bg_query_pos = torch.cat(
+                [
+                    bg_learn_query_pos + self.interaction_type_embedding.weight[self.interaction_type_to_id["learned_bg"]],
+                    bg_token_pos,
+                ],
+                dim=0,
+            )
+        else:
+            bg_queries = bg_learn_queries
+            bg_query_pos = bg_learn_query_pos + self.interaction_type_embedding.weight[self.interaction_type_to_id["learned_bg"]].to(device)
+
+        return fg_queries, fg_query_pos, fg_query_num_split, bg_queries, bg_query_pos
+
+    def _encode_interaction_tokens(self, tokens, obj_id, sample_coords, sample_features, mins, maxs):
+        device = sample_features.device
+        query_features = []
+        query_positions = []
+
+        for token in tokens:
+            token_type = token.get("type", "click")
+            type_id = self.interaction_type_to_id.get(token_type, self.interaction_type_to_id["click"])
+            type_embedding = self.interaction_type_embedding.weight[type_id].to(device)
+
+            indices = token.get("indices", [])
+            if len(indices) > 0:
+                index_tensor = torch.as_tensor(indices, dtype=torch.long, device=device)
+                index_tensor = torch.clamp(index_tensor, min=0, max=sample_features.shape[0] - 1)
+                token_features = sample_features[index_tensor].mean(dim=0)
+                token_coords = sample_coords[index_tensor]
+                anchor = token_coords.mean(dim=0)
+                extent = token_coords.max(dim=0)[0] - token_coords.min(dim=0)[0]
+            else:
+                anchor = torch.as_tensor(token.get("anchor", [0.0, 0.0, 0.0]), dtype=sample_coords.dtype, device=device)
+                extent = torch.as_tensor(token.get("extent", [0.0, 0.0, 0.0]), dtype=sample_coords.dtype, device=device)
+                token_features = torch.zeros(sample_features.shape[1], dtype=sample_features.dtype, device=device)
+
+            if "anchor" in token:
+                anchor = torch.as_tensor(token["anchor"], dtype=sample_coords.dtype, device=device)
+            if "extent" in token:
+                extent = torch.as_tensor(token["extent"], dtype=sample_coords.dtype, device=device)
+
+            text_hash = int(token.get("text_hash", 0)) % self.text_hash_embedding.num_embeddings
+            text_embedding = self.text_hash_embedding(torch.tensor(text_hash, dtype=torch.long, device=device))
+
+            geom = torch.cat(
+                [
+                    anchor.float(),
+                    extent.float(),
+                    torch.tensor([float(type_id) / max(1, len(self.interaction_type_to_id) - 1)], device=device),
+                    torch.tensor([float(text_hash) / float(self.text_hash_embedding.num_embeddings)], device=device),
+                ]
+            )
+            geom_embedding = self.interaction_geometry_mlp(geom)
+
+            anchor_pos = self.pos_enc(anchor.view(1, 1, 3).float(), input_range=[mins, maxs]).squeeze(0).squeeze(-1)
+            time_idx = min(int(token.get("time", 0)), self.time_encode.shape[0] - 1)
+            time_embedding = self.time_encode[time_idx].to(device)
+            obj_embedding = self.object_embedding(torch.tensor(min(obj_id, self.object_embedding.num_embeddings - 1), dtype=torch.long, device=device))
+
+            query_features.append(token_features + type_embedding + geom_embedding + text_embedding)
+            query_positions.append(anchor_pos + time_embedding + obj_embedding + type_embedding + geom_embedding + text_embedding)
+
+        if len(query_features) == 0:
+            raise ValueError(f"Object {obj_id} has no interaction tokens.")
+
+        return torch.stack(query_features, dim=0), torch.stack(query_positions, dim=0)
 
     def mask_module(self, fg_query_feat, bg_query_feat, mask_features, ret_attn_mask=True, fg_query_num_split=None):
 

@@ -55,7 +55,7 @@ class UserInteractiveSegmentationModel(abc.ABC):
         self.quantization_size = config.data.dataloader.voxel_size
         self.click_idx = {"0": []}
 
-    def get_next_click(self, click_idx, click_time_idx, click_positions, num_clicks, run_model, gt_labels=None, ori_coords=None, scene_name=None, **args):
+    def get_next_click(self, click_idx, click_time_idx, click_positions, num_clicks, run_model, gt_labels=None, ori_coords=None, scene_name=None, interactions=None, **args):
         """called by GUI to forward the clicks"""
 
         if run_model:
@@ -65,12 +65,13 @@ class UserInteractiveSegmentationModel(abc.ABC):
             else:
                 self.click_idx = click_idx
 
-                outputs = self.model.forward_mask(self.pcd_features, self.aux, self.coordinates, self.pos_encodings_pcd, click_idx=[self.click_idx], click_time_idx=[click_time_idx], scan_numbers=self.scan_numbers)
+                outputs = self.model.forward_mask(self.pcd_features, self.aux, self.coordinates, self.pos_encodings_pcd, click_idx=[self.click_idx], click_time_idx=[click_time_idx], scan_numbers=self.scan_numbers, interactions=[interactions] if interactions is not None else None)
 
                 pred = outputs["pred_masks"][0].argmax(1)
 
                 for obj_id, cids in self.click_idx.items():
-                    pred[cids] = int(obj_id)
+                    if len(cids) > 0:
+                        pred[cids] = int(obj_id)
 
                 pred_full = pred[self.inverse_map]
                 self.object_mask[:, 0] = pred_full.cpu().numpy()
@@ -83,7 +84,7 @@ class UserInteractiveSegmentationModel(abc.ABC):
 
                 f = open(self.record_file, "a")
                 now = datetime.now()
-                num_obj = len(click_idx.keys()) - 1
+                num_obj = max(1, len([obj_id for obj_id in click_idx.keys() if obj_id != "0"]))
                 num_click = sum([len(c) for c in click_idx.values()])
 
                 line = now.strftime("%Y-%m-%d-%H-%M-%S") + "  " + scene_name + "  NumObjects:" + str(num_obj) + "  AvgNumClicks:" + str(round(num_click / num_obj, 1)) + "  mIoU:" + sample_iou + "\n"
@@ -92,7 +93,7 @@ class UserInteractiveSegmentationModel(abc.ABC):
                 f.close()
 
                 np.save(os.path.join(self.mask_folder, "mask_" + str(round(num_click / num_obj, 1)) + "_" + sample_iou), pred_full.cpu().numpy())
-                np.save(os.path.join(self.click_folder, "click_" + str(round(num_click / num_obj, 1)) + "_" + sample_iou), {"click_idx": click_idx, "click_time": click_time_idx})
+                np.save(os.path.join(self.click_folder, "click_" + str(round(num_click / num_obj, 1)) + "_" + sample_iou), {"click_idx": click_idx, "click_time": click_time_idx, "interactions": interactions})
 
                 directory = os.path.dirname(self.record_file)
                 output_file = os.path.join(directory, "output.txt")

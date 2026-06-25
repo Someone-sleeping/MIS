@@ -3,6 +3,7 @@ import math
 import copy
 import random
 import warnings
+import hashlib
 import MinkowskiEngine as ME
 import torch
 import pytorch_lightning as pl
@@ -20,6 +21,7 @@ from datasets.utils import VoxelizeCollate
 from datasets.lidar_semantickitti import SemanticKittiDataset
 from datasets.lidar_nuscenes import NuscenesDataset
 from datasets.lidar_kitti360 import Kitti360Dataset
+from datasets.lidar_s3dis import S3DISDataset
 from models import Interactive4D
 from models.criterion import SetCriterion
 from models.metrics.utils import IoU_at_numClicks, NumClicks_for_IoU, NumClicks_for_IoU_class, mIoU_per_class_metric, mIoU_metric, losses_metric
@@ -55,6 +57,8 @@ class ObjectSegmentation(pl.LightningModule):
             self.label_mapping = datasets_info.nuScenes_challenge_label_mapping
         elif self.config.general.dataset == "kitti360":
             self.label_mapping = datasets_info.label_name_mapping_kitti360
+        elif self.config.general.dataset == "s3dis":
+            self.label_mapping = datasets_info.s3dis_label_mapping
         else:
             raise ValueError(f"Unknown dataset type: {self.config.general.dataset}")
 
@@ -86,7 +90,7 @@ class ObjectSegmentation(pl.LightningModule):
         self.log("mIoU_monitor", 0, sync_dist=True, logger=False)
         self.losses_metric = losses_metric()
         self.mIoU_metric = mIoU_metric()
-        self.mIoU_per_class_metric = mIoU_per_class_metric(training=True)
+        self.mIoU_per_class_metric = mIoU_per_class_metric(training=True, label_mapping=self.label_mapping)
 
         # Initiate the Validation metrics
         self.iou_at_numClicks = IoU_at_numClicks(num_clicks=self.clicks_of_interest)
@@ -108,14 +112,26 @@ class ObjectSegmentation(pl.LightningModule):
         self.save_hyperparameters()
 
     def setup(self, stage):
-        self.train_dataset = SemanticKittiDataset(
-            data_dir=self.config.data.datasets.data_dir,
-            sweep=self.config.data.datasets.sweep,
-            volume_augmentations_path=self.config.data.datasets.volume_augmentations_path,
-            mode="train",
-            center_coordinates=self.config.data.datasets.center_coordinates,
-            window_overlap=self.config.data.datasets.window_overlap,
-        )
+        if self.config.general.dataset == "s3dis":
+            self.train_dataset = S3DISDataset(
+                data_dir=self.config.data.datasets.s3dis_raw_dir,
+                sweep=self.config.data.datasets.sweep,
+                volume_augmentations_path=self.config.data.datasets.volume_augmentations_path,
+                mode="train",
+                center_coordinates=self.config.data.datasets.center_coordinates,
+                window_overlap=self.config.data.datasets.window_overlap,
+                validation_area=self.config.data.datasets.s3dis_validation_area,
+                max_points_per_room=self.config.data.datasets.s3dis_max_points_per_room,
+            )
+        else:
+            self.train_dataset = SemanticKittiDataset(
+                data_dir=self.config.data.datasets.data_dir,
+                sweep=self.config.data.datasets.sweep,
+                volume_augmentations_path=self.config.data.datasets.volume_augmentations_path,
+                mode="train",
+                center_coordinates=self.config.data.datasets.center_coordinates,
+                window_overlap=self.config.data.datasets.window_overlap,
+            )
         if self.config.general.dataset == "semantickitti":
             self.validation_dataset = SemanticKittiDataset(
                 data_dir=self.config.data.datasets.data_dir,
@@ -140,6 +156,16 @@ class ObjectSegmentation(pl.LightningModule):
                 sweep=self.config.data.datasets.sweep,
                 center_coordinates=self.config.data.datasets.center_coordinates,
                 window_overlap=self.config.data.datasets.window_overlap,
+            )
+        elif self.config.general.dataset == "s3dis":
+            self.validation_dataset = S3DISDataset(
+                data_dir=self.config.data.datasets.s3dis_raw_dir,
+                mode="validation",
+                sweep=self.config.data.datasets.sweep,
+                center_coordinates=self.config.data.datasets.center_coordinates,
+                window_overlap=self.config.data.datasets.window_overlap,
+                validation_area=self.config.data.datasets.s3dis_validation_area,
+                max_points_per_room=self.config.data.datasets.s3dis_max_points_per_room,
             )
         else:
             raise ValueError(f"Unknown dataset type: {self.config.general.dataset}")
@@ -217,7 +243,8 @@ class ObjectSegmentation(pl.LightningModule):
         self.interactive4d.train()
 
         #########  2. real forward pass  #########
-        outputs = self.interactive4d.forward_mask(pcd_features, aux, coordinates, pos_encodings_pcd, click_idx=click_idx, click_time_idx=click_time_idx, scan_numbers=data.F[:, 0])
+        interactions = self.build_interactions(batch_indicators, raw_coords, labels, click_idx, click_time_idx, obj2label)
+        outputs = self.interactive4d.forward_mask(pcd_features, aux, coordinates, pos_encodings_pcd, click_idx=click_idx, click_time_idx=click_time_idx, scan_numbers=data.F[:, 0], interactions=interactions)
 
         ######### 3. loss back propagation #########
         click_weights = cal_click_loss_weights(batch_indicators, raw_coords, torch.cat(labels), click_idx, self.config.loss.w_min, self.config.loss.w_max, self.config.loss.delta)
@@ -327,7 +354,8 @@ class ObjectSegmentation(pl.LightningModule):
             if current_num_clicks == 0:
                 pred = [torch.zeros(l.shape).to(coords) for l in labels]
             else:
-                outputs = self.interactive4d.forward_mask(pcd_features, aux, coordinates, pos_encodings_pcd, click_idx=click_idx, click_time_idx=click_time_idx, scan_numbers=data.F[:, 0])
+                interactions = self.build_interactions(batch_indicators, raw_coords, labels, click_idx, click_time_idx, obj2label)
+                outputs = self.interactive4d.forward_mask(pcd_features, aux, coordinates, pos_encodings_pcd, click_idx=click_idx, click_time_idx=click_time_idx, scan_numbers=data.F[:, 0], interactions=interactions)
                 pred_logits = outputs["pred_masks"]
                 pred = [p.argmax(-1) for p in pred_logits]
 
@@ -560,7 +588,7 @@ class ObjectSegmentation(pl.LightningModule):
                 start_index = end_index
 
         # logging visualization into wandb
-        if (self.config.logging.visualization_frequency is not None) and (batch_idx % self.config.logging.visualization_frequency == 0):
+        if self.config.logging.get("use_wandb", True) and (self.config.logging.visualization_frequency is not None) and (batch_idx % self.config.logging.visualization_frequency == 0):
             # choose a random scene to visualize from the batch
             chosen_scene_idx = random.randint(0, batch_size - 1)
             scene_name = scene_names[chosen_scene_idx][0]
@@ -579,7 +607,8 @@ class ObjectSegmentation(pl.LightningModule):
             wandb.log({f"point_scene/prediction_{scene_name}_quantized_iou_{general_miou:.2f}": pred_scene})
 
     def on_validation_epoch_end(self):
-        torch.distributed.barrier()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
         if self.global_rank == 0:
             print("\n")
             print("--------- Evaluating Validation Performance  -----------")
@@ -763,7 +792,8 @@ class ObjectSegmentation(pl.LightningModule):
         for class_type in self.label_mapping.values():
             self.iou_at_numClicks_class[class_type].reset()
 
-        torch.distributed.barrier()
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            torch.distributed.barrier()
 
     def pre_interactive_sampling(
         self,
@@ -801,6 +831,7 @@ class ObjectSegmentation(pl.LightningModule):
                         click_idx=click_idx,
                         click_time_idx=click_time_idx,
                         scan_numbers=scan_numbers,
+                        interactions=self.build_interactions(batch_indicators, raw_coords, labels, click_idx, click_time_idx),
                     )
                     pred_logits = outputs["pred_masks"]
                     pred = [p.argmax(-1) for p in pred_logits]
@@ -841,6 +872,133 @@ class ObjectSegmentation(pl.LightningModule):
                 current_num_iter += 1
 
             return click_idx, click_time_idx
+
+    def build_interactions(self, batch_indicators, raw_coords, labels, click_idx, click_time_idx, obj2label=None):
+        if not self.config.get("interactions", {}).get("enabled", True):
+            return None
+
+        modes = self.config.get("interactions", {}).get("modes", ["click", "line", "box", "text"])
+        modes = set(modes)
+        max_box_points = self.config.get("interactions", {}).get("max_box_points", 256)
+        batch_size = int(batch_indicators.max().item()) + 1
+        interactions = []
+
+        for sample_idx in range(batch_size):
+            sample_mask = batch_indicators == sample_idx
+            sample_raw_coords = raw_coords[sample_mask]
+            sample_labels = labels[sample_idx]
+            sample_obj2label = obj2label[sample_idx] if obj2label is not None else None
+            interactions.append(
+                self.build_sample_interactions(
+                    sample_raw_coords=sample_raw_coords,
+                    sample_labels=sample_labels,
+                    sample_click_idx=click_idx[sample_idx],
+                    sample_click_time_idx=click_time_idx[sample_idx],
+                    sample_obj2label=sample_obj2label,
+                    modes=modes,
+                    max_box_points=max_box_points,
+                )
+            )
+
+        return interactions
+
+    def build_sample_interactions(
+        self,
+        sample_raw_coords,
+        sample_labels,
+        sample_click_idx,
+        sample_click_time_idx,
+        sample_obj2label,
+        modes,
+        max_box_points,
+    ):
+        sample_interactions = {}
+        for obj_id, click_ids in sample_click_idx.items():
+            tokens = []
+            click_times = sample_click_time_idx.get(obj_id, [])
+
+            if "click" in modes:
+                for click_offset, click_id in enumerate(click_ids):
+                    token_time = click_times[click_offset] if click_offset < len(click_times) else click_offset
+                    tokens.append({"type": "click", "indices": [int(click_id)], "time": int(token_time)})
+
+            if obj_id != "0" and "line" in modes and len(click_ids) >= 2:
+                first_click, last_click = int(click_ids[0]), int(click_ids[-1])
+                token_time = max(click_times) if click_times else len(click_ids) - 1
+                tokens.append(
+                    {
+                        "type": "line",
+                        "indices": [first_click, last_click],
+                        "time": int(token_time),
+                    }
+                )
+
+            if obj_id != "0" and "box" in modes and len(click_ids) > 0:
+                obj_mask = sample_labels == int(obj_id)
+                obj_indices = torch.nonzero(obj_mask, as_tuple=False).flatten()
+                if obj_indices.numel() > 0:
+                    if obj_indices.numel() > max_box_points:
+                        selected = torch.linspace(0, obj_indices.numel() - 1, steps=max_box_points, device=obj_indices.device).long()
+                        obj_indices = obj_indices[selected]
+                    obj_coords = sample_raw_coords[obj_indices]
+                    extent = obj_coords.max(dim=0)[0] - obj_coords.min(dim=0)[0]
+                    anchor = obj_coords.mean(dim=0)
+                    tokens.append(
+                        {
+                            "type": "box",
+                            "indices": [int(i) for i in obj_indices.detach().cpu().tolist()],
+                            "anchor": [float(v) for v in anchor.detach().cpu().tolist()],
+                            "extent": [float(v) for v in extent.detach().cpu().tolist()],
+                            "time": int(max(click_times) if click_times else 0),
+                        }
+                    )
+
+            if obj_id != "0" and "text" in modes and len(click_ids) > 0:
+                class_name = self.get_interaction_class_name(sample_obj2label, obj_id)
+                obj_mask = sample_labels == int(obj_id)
+                obj_indices = torch.nonzero(obj_mask, as_tuple=False).flatten()
+                if obj_indices.numel() > 0:
+                    obj_coords = sample_raw_coords[obj_indices]
+                    anchor = obj_coords.mean(dim=0)
+                    extent = obj_coords.max(dim=0)[0] - obj_coords.min(dim=0)[0]
+                elif len(click_ids) > 0:
+                    click_coords = sample_raw_coords[torch.as_tensor(click_ids, dtype=torch.long, device=sample_raw_coords.device)]
+                    anchor = click_coords.mean(dim=0)
+                    extent = click_coords.max(dim=0)[0] - click_coords.min(dim=0)[0]
+                else:
+                    anchor = torch.zeros(3, device=sample_raw_coords.device)
+                    extent = torch.zeros(3, device=sample_raw_coords.device)
+                tokens.append(
+                    {
+                        "type": "text",
+                        "indices": [],
+                        "anchor": [float(v) for v in anchor.detach().cpu().tolist()],
+                        "extent": [float(v) for v in extent.detach().cpu().tolist()],
+                        "text": class_name,
+                        "text_hash": self.stable_text_hash(class_name),
+                        "time": int(max(click_times) if click_times else 0),
+                    }
+                )
+
+            sample_interactions[obj_id] = tokens
+
+        return sample_interactions
+
+    def get_interaction_class_name(self, sample_obj2label, obj_id):
+        if sample_obj2label is None or obj_id not in sample_obj2label:
+            return "object"
+
+        semantic_label = sample_obj2label[obj_id]
+        if self.dataset_type == "semantickitti":
+            semantic_label = semantic_label & 0xFFFF
+        elif "nuScenes" in self.dataset_type or self.dataset_type == "kitti360":
+            semantic_label = semantic_label // 1000
+
+        return self.label_mapping.get(semantic_label, "object")
+
+    @staticmethod
+    def stable_text_hash(text):
+        return int(hashlib.md5(text.encode("utf-8")).hexdigest()[:8], 16)
 
     def verify_labels_post_quantization(self, labels, click_idx, obj2label, batch_size):
         """Remove objects which are not in the scene (due to quantization) and update the labels accordingly

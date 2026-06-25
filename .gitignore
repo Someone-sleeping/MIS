@@ -7,6 +7,8 @@
 /ckpt
 /logs
 __pycache__/
+/data/
+/interactive_scenes*/
 /data/semantic_kitti
 /outputs/*
 /wandb

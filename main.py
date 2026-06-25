@@ -7,7 +7,7 @@ import torch
 from dotenv import load_dotenv
 from omegaconf import DictConfig, OmegaConf
 from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.loggers import WandbLogger
+from pytorch_lightning.loggers import CSVLogger, WandbLogger
 from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 
 from trainer.trainer import ObjectSegmentation
@@ -33,15 +33,18 @@ def setup_loggers(cfg: DictConfig):
     cfg.logging.save_dir = os.path.join("saved", cfg.general.experiment_name)
 
     os.makedirs(cfg.logging.save_dir, exist_ok=True)
-    loggers.append(
-        WandbLogger(
-            project=cfg.logging.project_name,
-            name=cfg.general.experiment_name,
-            save_dir=cfg.logging.save_dir,
-            id=cfg.general.experiment_name,
-            entity=cfg.logging.entity,
+    if cfg.logging.get("use_wandb", True):
+        loggers.append(
+            WandbLogger(
+                project=cfg.logging.project_name,
+                name=cfg.general.experiment_name,
+                save_dir=cfg.logging.save_dir,
+                id=cfg.general.experiment_name,
+                entity=cfg.logging.entity,
+            )
         )
-    )
+    else:
+        loggers.append(CSVLogger(save_dir=cfg.logging.save_dir, name="csv"))
     loggers[-1].log_hyperparams(flatten_dict(OmegaConf.to_container(cfg, resolve=True)))
 
     return loggers
@@ -66,10 +69,14 @@ def get_parameters(cfg: DictConfig):
         cfg.trainer.num_nodes = 1
         cfg.trainer.detect_anomaly = True
         cfg.trainer.log_every_n_steps = 1
-        cfg.trainer.max_epochs = 5
-        cfg.trainer.check_val_every_n_epoch = 5
-        cfg.trainer.limit_train_batches = 2
-        cfg.trainer.limit_val_batches = 2
+        cfg.trainer.max_epochs = 1
+        cfg.trainer.check_val_every_n_epoch = 1
+        cfg.trainer.limit_train_batches = 1
+        cfg.trainer.limit_val_batches = 1
+        cfg.data.dataloader.num_workers = 0
+        if cfg.general.dataset == "s3dis":
+            cfg.data.datasets.s3dis_max_points_per_room = min(cfg.data.datasets.s3dis_max_points_per_room, 20000)
+        cfg.logging.use_wandb = False
 
         os.environ.update({"WANDB_MODE": "dryrun", "TORCH_DISTRIBUTED_DEBUG": "DETAIL", "TORCH_CPP_LOG_LEVEL": "INFO", "GLOO_LOG_LEVEL": "DEBUG", "OMP_NUM_THREADS": "1", "MKL_NUM_THREADS": "1"})
 
@@ -88,13 +95,11 @@ def configure_callbacks(cfg: DictConfig):
     return [
         ModelCheckpoint(
             verbose=True,
-            save_top_k=1,
+            save_top_k=-1,
             save_last=True,
-            monitor="mIoU_epoch",
-            mode="max",
             dirpath=cfg.logging.save_dir,
             every_n_epochs=1,
-            filename="{epoch:02d}-{mIoU_epoch:.3f}",
+            filename="{epoch:02d}",
             save_on_train_epoch_end=True,
         ),
         LearningRateMonitor(),
@@ -108,6 +113,7 @@ def train(cfg: DictConfig):
     """
     cfg, model, loggers = get_parameters(cfg)
     callbacks = configure_callbacks(cfg)
+    strategy = "ddp_find_unused_parameters_false" if cfg.trainer.num_devices * cfg.trainer.num_nodes > 1 else "auto"
     runner = Trainer(
         callbacks=callbacks,
         logger=loggers,
@@ -122,7 +128,7 @@ def train(cfg: DictConfig):
         limit_val_batches=cfg.trainer.limit_val_batches,
         detect_anomaly=cfg.trainer.detect_anomaly,
         num_sanity_val_steps=cfg.trainer.num_sanity_val_steps,
-        strategy="ddp_find_unused_parameters_false",
+        strategy=strategy,
     )
     runner.fit(model, ckpt_path=cfg.general.ckpt_path)
 
@@ -132,6 +138,7 @@ def validate(cfg: DictConfig):
     Validate the model using the validation dataset.
     """
     cfg, model, loggers = get_parameters(cfg)
+    strategy = "ddp_find_unused_parameters_false" if cfg.trainer.num_devices * cfg.trainer.num_nodes > 1 else "auto"
     runner = Trainer(
         logger=loggers,
         default_root_dir=cfg.logging.save_dir,
@@ -140,7 +147,7 @@ def validate(cfg: DictConfig):
         accelerator="gpu",
         check_val_every_n_epoch=cfg.trainer.check_val_every_n_epoch,
         limit_val_batches=cfg.trainer.limit_train_batches,
-        strategy="ddp_find_unused_parameters_false",
+        strategy=strategy,
     )
     runner.validate(model, ckpt_path=cfg.general.ckpt_path)
 

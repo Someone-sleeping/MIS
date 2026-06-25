@@ -30,10 +30,13 @@ if __name__ == "__main__":
     parser.add_argument("--point_type", type=str, default="pointcloud", help="choose between 'mesh' and 'pointcloud'. If not given, the type will be determined automatically")
     parser.add_argument("--dataset_scenes", type=str, default="", help="specify the path to the preprocessed scenes directory")
     parser.add_argument("--weights", type=str, default="", help="specify the path to the weights (ckpt) file")
+    parser.add_argument("--voxel_size", type=float, default=None, help="override voxel size for interactive inference")
     args = parser.parse_args()
 
     if args.weights:
         config.general.ckpt_path = args.weights
+    if args.voxel_size is not None:
+        config.data.dataloader.voxel_size = args.voxel_size
     if args.dataset_scenes:
         config.dataset_scenes = args.dataset_scenes
     else:

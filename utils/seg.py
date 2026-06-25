@@ -41,6 +41,10 @@ def mean_iou(pred, labels, obj2label, dataset_type="semantickitti"):
                 original_label = label_mapping[obj2label[b][str(int(obj_id.item()))] & 0xFFFF]
             elif "nuScenes" in dataset_type:
                 original_label = label_mapping[obj2label[b][str(int(obj_id.item()))] // 1000]
+            elif dataset_type == "s3dis":
+                original_label = label_mapping[obj2label[b][str(int(obj_id.item()))]]
+            elif dataset_type == "kitti360":
+                original_label = label_mapping[obj2label[b][str(int(obj_id.item()))] // 1000]
             obj_iou = mean_iou_single(pred_sample == obj_id, labels_sample == obj_id)
             iou_sample += obj_iou
             # Accumulate IoU for each original label
@@ -76,6 +80,8 @@ def mean_iou_validation(pred, labels, obj2label, label_mapping=None, dataset_typ
             objects_info[obj_id]["class"] = label_mapping[obj2label[0][obj_id] // 1000]
         elif dataset_type == "kitti360":
             objects_info[obj_id]["class"] = label_mapping[obj2label[0][obj_id] // 1000]
+        elif dataset_type == "s3dis":
+            objects_info[obj_id]["class"] = label_mapping[obj2label[0][obj_id]]
 
     for b in range(bs):
         pred_sample = pred[b]
@@ -91,6 +97,8 @@ def mean_iou_validation(pred, labels, obj2label, label_mapping=None, dataset_typ
                 original_label = label_mapping[obj2label[b][str(int(obj_id.item()))] // 1000]
             elif dataset_type == "kitti360":
                 original_label = label_mapping[obj2label[b][str(int(obj_id.item()))] // 1000]
+            elif dataset_type == "s3dis":
+                original_label = label_mapping[obj2label[b][str(int(obj_id.item()))]]
             obj_iou = mean_iou_single(pred_sample == obj_id, labels_sample == obj_id)
             objects_info[str(int(obj_id.item()))]["miou"] = obj_iou.item()
             iou_sample += obj_iou
@@ -166,10 +174,13 @@ def cal_click_loss_weights(batch_idx, raw_coords, labels, click_idx, w_min, w_ma
         click_idx_sample = click_idx[i]
         sample_mask = batch_idx == i
         raw_coords_sample = raw_coords[sample_mask]
-        all_click_idx = [np.array(v) for k, v in click_idx_sample.items()]
-        all_click_idx = np.hstack(all_click_idx).astype(np.int64).tolist()
-        click_points_sample = raw_coords_sample[all_click_idx]
-        weights_sample = loss_weights(raw_coords_sample, click_points_sample, w_min, w_max, delta)
+        all_click_idx = [np.array(v) for k, v in click_idx_sample.items() if len(v) > 0]
+        if all_click_idx:
+            all_click_idx = np.hstack(all_click_idx).astype(np.int64).tolist()
+            click_points_sample = raw_coords_sample[all_click_idx]
+            weights_sample = loss_weights(raw_coords_sample, click_points_sample, w_min, w_max, delta)
+        else:
+            weights_sample = torch.ones(raw_coords_sample.shape[0], device=raw_coords_sample.device)
         weights.append(weights_sample)
 
     return weights
@@ -181,7 +192,11 @@ def get_label_mapping(dataset_type):
     elif dataset_type == "nuScenes_challenge":
         label_mapping = datasets_info.nuScenes_challenge_label_mapping
     elif dataset_type == "nuScenes_general":
-        label_mapping = datasets_info.datnuScenes_general_label_mapping
+        label_mapping = datasets_info.nuScenes_general_label_mapping
+    elif dataset_type == "kitti360":
+        label_mapping = datasets_info.label_name_mapping_kitti360
+    elif dataset_type == "s3dis":
+        label_mapping = datasets_info.s3dis_label_mapping
     return label_mapping
 
 
@@ -190,8 +205,10 @@ def get_class_name(dataset_type, obj2label, b, obj_id, label_mapping):
         original_label = label_mapping[obj2label[b][obj_id] & 0xFFFF]
     elif "nuScenes" in dataset_type:
         original_label = label_mapping[obj2label[b][obj_id] // 1000]
-    if dataset_type == "kitti360":
+    elif dataset_type == "kitti360":
         original_label = label_mapping[obj2label[b][obj_id] // 1000]
+    elif dataset_type == "s3dis":
+        original_label = label_mapping[obj2label[b][obj_id]]
     return original_label
 
 
@@ -226,6 +243,10 @@ def get_things_stuff_miou(dataset_type, class_IoU_weighted_results, label_mappin
     elif dataset_type == "kitti360":
         ignore_labels = {"unlabeled", "unknown construction", "unknown vehicle", "unknown object"}
         thing_labels, stuff_labels = get_things_stuff_split_kitti360()
+    elif dataset_type == "s3dis":
+        ignore_labels = datasets_info.s3dis_ignore_labels
+        thing_labels = datasets_info.s3dis_thing_labels
+        stuff_labels = datasets_info.s3dis_stuff_labels
     classwise_mIoU_score = {}
     for click_of_interest in clicks_of_interest:
         classwise_mIoU_score[f"classwise_miou_things@{click_of_interest}"] = []

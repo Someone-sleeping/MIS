@@ -141,10 +141,10 @@ class mIoU_per_class_metric(Metric):
     higher_is_better = True
     full_state_update = True
 
-    def __init__(self, training=True):
+    def __init__(self, training=True, label_mapping=None):
         super().__init__()
         self.training = training
-        self.label_mapping = datasets_info.semantickitti_label_mapping
+        self.label_mapping = label_mapping or datasets_info.semantickitti_label_mapping
         for _, label in self.label_mapping.items():
             self.add_state(f"miou_for_{label}", default=torch.tensor(0.0), dist_reduce_fx="mean")
             self.add_state(f"count_for_{label}", default=torch.tensor(0.0), dist_reduce_fx="mean")
@@ -186,4 +186,5 @@ class MemoryUsageLogger(Callback):
         cpu_memory_used = memory_info.used / (1024**3)  # Convert to GB
         cpu_memory_available = memory_info.available / (1024**3)  # Convert to GB
         # Use self.log to log metrics
-        pl_module.logger.experiment.log({f"System/CPU Memory Used (GB) [{log_point}]": cpu_memory_used, f"System/CPU Memory Available (GB) [{log_point}]": cpu_memory_available})
+        if hasattr(pl_module.logger.experiment, "log"):
+            pl_module.logger.experiment.log({f"System/CPU Memory Used (GB) [{log_point}]": cpu_memory_used, f"System/CPU Memory Available (GB) [{log_point}]": cpu_memory_available})

@@ -190,3 +190,28 @@ def get_things_stuff_split_kitti360():
             stuff_labels.add(label.name)
 
     return thing_labels, stuff_labels
+
+
+###############################
+######### S3DIS dataset #######
+###############################
+
+s3dis_label_mapping = {
+    0: "unlabeled",
+    1: "ceiling",
+    2: "floor",
+    3: "wall",
+    4: "beam",
+    5: "column",
+    6: "window",
+    7: "door",
+    8: "table",
+    9: "chair",
+    10: "sofa",
+    11: "bookcase",
+    12: "board",
+    13: "clutter",
+}
+s3dis_ignore_labels = {"unlabeled"}
+s3dis_thing_labels = {"beam", "column", "window", "door", "table", "chair", "sofa", "bookcase", "board", "clutter"}
+s3dis_stuff_labels = {"ceiling", "floor", "wall"}

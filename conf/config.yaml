@@ -1,10 +1,10 @@
 general:
   debug: false # Options: true, false
   mode: "train" # Options: train, validate
-  ckpt_path: /home/ckpt/interactive4d_sweep4.ckpt
+  ckpt_path: null
   gpus: null
   seed: 42
-  dataset: semantickitti # Options: semantickitti, nuScenes_general, nuScenes_challenge, kitti360
+  dataset: s3dis # Options: semantickitti, nuScenes_general, nuScenes_challenge, kitti360, s3dis
   rank_error_strategy: "SI" # Options: SI, BD.
   initial_clicking_strategy: "centroid" # Options: centroid, random, boundary_dependent, dbscan.
   refinement_clicking_strategy: "random" # Options: centroid, random, boundary_dependent, dbscan.
@@ -13,6 +13,7 @@ general:
   iou_targets: [0.5, 0.65, 0.80, 0.85, 0.90]
 
 logging:
+  use_wandb: false
   project_name: Interactive4D
   workspace: USER_SPACE
   entity: USER_ENTITY
@@ -51,8 +52,11 @@ trainer:
 data:
   datasets:
     data_dir: datasets/jsons/
+    s3dis_raw_dir: data/S3DIS/Stanford3dDataset_v1.2
+    s3dis_validation_area: Area_5
+    s3dis_max_points_per_room: 9000
     add_distance: true
-    sweep: 4
+    sweep: 1
     center_coordinates: true
     window_overlap: 0
     volume_augmentations_path: conf/augmentation/volumentations_aug.yaml
@@ -61,10 +65,15 @@ data:
     num_workers: 12
     batch_size: 1
     test_batch_size: 1
-    voxel_size: 0.1
+    voxel_size: 0.22
 
 optimizer:
   lr: 0.0002
+
+interactions:
+  enabled: true
+  modes: [click, line, box, text]
+  max_box_points: 64
 
 loss:
   aux: true
