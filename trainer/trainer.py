@@ -6,6 +6,7 @@ import warnings
 import hashlib
 import MinkowskiEngine as ME
 import torch
+import torch.nn.functional as F
 import pytorch_lightning as pl
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import OneCycleLR
@@ -46,6 +47,11 @@ class ObjectSegmentation(pl.LightningModule):
             voxel_size=config.data.dataloader.voxel_size,
             sample_sizes=[4000, 8000, 16000, 32000],
             sweep_size=self.config.data.datasets.sweep,
+            text_encoder_backend=config.text_encoder.get("backend", "hash_ngram"),
+            text_encoder_model_name_or_path=config.text_encoder.get("model_name_or_path", None),
+            freeze_text_encoder=config.text_encoder.get("freeze", False),
+            text_encoder_vocab_size=config.text_encoder.get("vocab_size", 8192),
+            text_encoder_dim=config.text_encoder.get("embedding_dim", 256),
         )
 
         self.dataset_type = self.config.general.dataset
@@ -67,10 +73,12 @@ class ObjectSegmentation(pl.LightningModule):
             "loss_bce": self.config.loss.bce_loss_coef,
             "loss_dice": self.config.loss.dice_loss_coef,
         }
+        if self.config.loss.get("text_alignment_coef", 0.0) > 0:
+            weight_dict["loss_text_alignment"] = self.config.loss.text_alignment_coef
         if config.loss.aux:
             aux_weight_dict = {}
             for i in range(self.interactive4d.num_decoders):
-                aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items()})
+                aux_weight_dict.update({k + f"_{i}": v for k, v in weight_dict.items() if k in {"loss_bce", "loss_dice"}})
             weight_dict.update(aux_weight_dict)
         self.criterion = SetCriterion(losses=["bce", "dice"], weight_dict=weight_dict)
 
@@ -110,6 +118,28 @@ class ObjectSegmentation(pl.LightningModule):
         warnings.filterwarnings("ignore", message=".*but the value needs to be floating point.*")
 
         self.save_hyperparameters()
+        self.initialize_from_checkpoint()
+
+    def initialize_from_checkpoint(self):
+        init_from_ckpt = self.config.general.get("init_from_ckpt", None)
+        if not init_from_ckpt:
+            return
+        checkpoint = torch.load(init_from_ckpt, map_location="cpu")
+        state_dict = checkpoint["state_dict"] if "state_dict" in checkpoint else checkpoint
+        interactive_state = {
+            key.replace("interactive4d.", "", 1): value
+            for key, value in state_dict.items()
+            if key.startswith("interactive4d.")
+        }
+        missing_keys, unexpected_keys = self.interactive4d.load_state_dict(interactive_state, strict=False)
+        ignored_missing = [key for key in missing_keys if key.startswith("text_encoder") or key == "text_null_embedding"]
+        relevant_missing = [key for key in missing_keys if key not in ignored_missing]
+        unexpected_keys = [key for key in unexpected_keys if not key.startswith("text_hash_embedding")]
+        if relevant_missing:
+            print(f"Missing pretrained Interactive4D keys: {relevant_missing}")
+        if unexpected_keys:
+            print(f"Unexpected pretrained Interactive4D keys: {unexpected_keys}")
+        print(f"Initialized Interactive4D weights from {init_from_ckpt}")
 
     def setup(self, stage):
         if self.config.general.dataset == "s3dis":
@@ -249,6 +279,9 @@ class ObjectSegmentation(pl.LightningModule):
         ######### 3. loss back propagation #########
         click_weights = cal_click_loss_weights(batch_indicators, raw_coords, torch.cat(labels), click_idx, self.config.loss.w_min, self.config.loss.w_max, self.config.loss.delta)
         loss_dict = self.criterion(outputs, labels, obj2label, click_weights)
+        text_alignment_loss = self.text_alignment_loss(outputs["backbone_features"], labels, obj2label)
+        if text_alignment_loss is not None:
+            loss_dict["loss_text_alignment"] = text_alignment_loss
         weight_dict = self.criterion.weight_dict
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
 
@@ -872,6 +905,56 @@ class ObjectSegmentation(pl.LightningModule):
                 current_num_iter += 1
 
             return click_idx, click_time_idx
+
+    def text_alignment_loss(self, pcd_features, labels, obj2label):
+        if self.config.loss.get("text_alignment_coef", 0.0) <= 0:
+            return None
+
+        feature_splits = pcd_features.decomposed_features if self.interactive4d.is_cuda_available else [pcd_features.F]
+        object_features = []
+        target_indices = []
+        class_to_index = {}
+        class_texts = []
+
+        for sample_idx, sample_features in enumerate(feature_splits):
+            sample_labels = labels[sample_idx].to(sample_features.device)
+            if sample_labels.shape[0] != sample_features.shape[0]:
+                valid_len = min(sample_labels.shape[0], sample_features.shape[0])
+                sample_labels = sample_labels[:valid_len]
+                sample_features = sample_features[:valid_len]
+
+            sample_obj2label = obj2label[sample_idx] if obj2label is not None else None
+            for obj_id_tensor in torch.unique(sample_labels):
+                obj_id = int(obj_id_tensor.item())
+                if obj_id == 0:
+                    continue
+                obj_mask = sample_labels == obj_id
+                if obj_mask.sum() == 0:
+                    continue
+
+                class_name = self.get_interaction_class_name(sample_obj2label, str(obj_id))
+                class_prompt = self.get_text_prompt(class_name)
+                if class_prompt not in class_to_index:
+                    class_to_index[class_prompt] = len(class_texts)
+                    class_texts.append(class_prompt)
+
+                object_features.append(sample_features[obj_mask].mean(dim=0))
+                target_indices.append(class_to_index[class_prompt])
+
+        if len(object_features) == 0 or len(class_texts) <= 1:
+            return pcd_features.F.sum() * 0.0
+
+        object_features = F.normalize(torch.stack(object_features, dim=0), dim=-1)
+        text_features = self.interactive4d.encode_texts(class_texts, device=object_features.device, normalize=True)
+        temperature = float(self.config.loss.get("text_alignment_temperature", 0.07))
+        logits = object_features @ text_features.T / max(temperature, 1e-6)
+        targets = torch.as_tensor(target_indices, dtype=torch.long, device=object_features.device)
+        return F.cross_entropy(logits, targets)
+
+    def get_text_prompt(self, class_name):
+        templates = self.config.get("text_encoder", {}).get("prompt_templates", ["{class_name}"])
+        template = random.choice(list(templates)) if templates else "{class_name}"
+        return template.format(class_name=class_name)
 
     def build_interactions(self, batch_indicators, raw_coords, labels, click_idx, click_time_idx, obj2label=None):
         if not self.config.get("interactions", {}).get("enabled", True):

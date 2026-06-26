@@ -11,6 +11,7 @@ from torch.cuda.amp import autocast
 from models import Res16UNet34C
 from models.modules.attention import CrossAttentionLayer, SelfAttentionLayer, FFNLayer
 from models.position_embedding import PositionalEncoding1D, PositionEmbeddingCoordsSine, PositionalEncoding3D
+from models.text_encoder import TextEncoder
 
 
 class Interactive4D(nn.Module):
@@ -28,6 +29,11 @@ class Interactive4D(nn.Module):
         voxel_size,
         sample_sizes,
         sweep_size,
+        text_encoder_backend="hash_ngram",
+        text_encoder_model_name_or_path=None,
+        freeze_text_encoder=False,
+        text_encoder_vocab_size=8192,
+        text_encoder_dim=256,
     ):
         super().__init__()
 
@@ -143,7 +149,15 @@ class Interactive4D(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
         )
-        self.text_hash_embedding = nn.Embedding(4096, hidden_dim)
+        self.text_encoder = TextEncoder(
+            output_dim=hidden_dim,
+            backend=text_encoder_backend,
+            model_name_or_path=text_encoder_model_name_or_path,
+            freeze=freeze_text_encoder,
+            vocab_size=text_encoder_vocab_size,
+            embedding_dim=text_encoder_dim,
+        )
+        self.text_null_embedding = nn.Parameter(torch.zeros(hidden_dim))
 
     def forward_backbone(self, x, raw_coordinates=None, is_eval=False):
         device = x.device
@@ -385,15 +399,19 @@ class Interactive4D(nn.Module):
             if "extent" in token:
                 extent = torch.as_tensor(token["extent"], dtype=sample_coords.dtype, device=device)
 
-            text_hash = int(token.get("text_hash", 0)) % self.text_hash_embedding.num_embeddings
-            text_embedding = self.text_hash_embedding(torch.tensor(text_hash, dtype=torch.long, device=device))
+            token_text = token.get("text", "")
+            if token_type == "text" and token_text:
+                text_embedding = self.encode_texts([token_text], device=device).squeeze(0)
+            else:
+                text_embedding = self.text_null_embedding.to(device)
+            text_hash = int(token.get("text_hash", 0)) % 4096
 
             geom = torch.cat(
                 [
                     anchor.float(),
                     extent.float(),
                     torch.tensor([float(type_id) / max(1, len(self.interaction_type_to_id) - 1)], device=device),
-                    torch.tensor([float(text_hash) / float(self.text_hash_embedding.num_embeddings)], device=device),
+                    torch.tensor([float(text_hash) / 4096.0], device=device),
                 ]
             )
             geom_embedding = self.interaction_geometry_mlp(geom)
@@ -410,6 +428,12 @@ class Interactive4D(nn.Module):
             raise ValueError(f"Object {obj_id} has no interaction tokens.")
 
         return torch.stack(query_features, dim=0), torch.stack(query_positions, dim=0)
+
+    def encode_texts(self, texts, device=None, normalize=False):
+        device = device or self.text_null_embedding.device
+        if normalize:
+            return self.text_encoder.normalized(texts, device=device)
+        return self.text_encoder(texts, device=device)
 
     def mask_module(self, fg_query_feat, bg_query_feat, mask_features, ret_attn_mask=True, fg_query_num_split=None):
 

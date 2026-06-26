@@ -2,6 +2,7 @@ general:
   debug: false # Options: true, false
   mode: "train" # Options: train, validate
   ckpt_path: null
+  init_from_ckpt: null
   gpus: null
   seed: 42
   dataset: s3dis # Options: semantickitti, nuScenes_general, nuScenes_challenge, kitti360, s3dis
@@ -75,6 +76,17 @@ interactions:
   modes: [click, line, box, text]
   max_box_points: 64
 
+text_encoder:
+  backend: hash_ngram # Options: hash_ngram, hf_clip
+  model_name_or_path: null # local HuggingFace CLIP text model path when backend=hf_clip
+  freeze: false
+  vocab_size: 8192
+  embedding_dim: 256
+  prompt_templates:
+    - "{class_name}"
+    - "a 3d point cloud of {class_name}"
+    - "segment the {class_name}"
+
 loss:
   aux: true
   w_min: 0.5
@@ -82,3 +94,5 @@ loss:
   delta: 2
   bce_loss_coef: 1.0
   dice_loss_coef: 2.0
+  text_alignment_coef: 0.2
+  text_alignment_temperature: 0.07

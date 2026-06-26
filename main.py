@@ -163,6 +163,8 @@ def main():
     parser.add_argument("--validate", action="store_true", help="Run Evaluation mode")
     parser.add_argument("--voxel_size", type=float, help="Specify the voxel size")
     parser.add_argument("--num_sweeps", type=int, help="Specify the number of sweeps")
+    parser.add_argument("--ckpt_path", type=str, help="Resume full Lightning training state from a checkpoint")
+    parser.add_argument("--init_from_ckpt", type=str, help="Initialize model weights from a checkpoint without resuming optimizer state")
     args = parser.parse_args()
 
     # Load configuration
@@ -183,6 +185,13 @@ def main():
     if args.num_sweeps is not None:
         cfg.data.datasets.sweep = args.num_sweeps
         print(f"Number of sweeps changed to {cfg.data.datasets.sweep}")
+    if args.init_from_ckpt is not None:
+        cfg.general.init_from_ckpt = args.init_from_ckpt
+        print(f"Initializing weights from {cfg.general.init_from_ckpt}")
+    if args.ckpt_path is not None:
+        cfg.general.ckpt_path = args.ckpt_path
+        cfg.general.init_from_ckpt = None
+        print(f"Resuming training from {cfg.general.ckpt_path}")
 
     # Execute based on mode
     if mode == "train":

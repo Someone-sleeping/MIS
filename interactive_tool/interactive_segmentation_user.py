@@ -17,7 +17,25 @@ class UserInteractiveSegmentationModel(abc.ABC):
         # load model
         self.pretrained_weights_file = self.config.general.ckpt_path
 
-        self.model = Interactive4D(num_heads=8, num_decoders=3, hidden_dim=128, dim_feedforward=1024, shared_decoder=False, num_bg_queries=10, dropout=0.0, pre_norm=False, aux=True, voxel_size=config.data.dataloader.voxel_size, sample_sizes=[4000, 8000, 16000, 32000], sweep_size=self.config.data.datasets.sweep)
+        self.model = Interactive4D(
+            num_heads=8,
+            num_decoders=3,
+            hidden_dim=128,
+            dim_feedforward=1024,
+            shared_decoder=False,
+            num_bg_queries=10,
+            dropout=0.0,
+            pre_norm=False,
+            aux=True,
+            voxel_size=config.data.dataloader.voxel_size,
+            sample_sizes=[4000, 8000, 16000, 32000],
+            sweep_size=self.config.data.datasets.sweep,
+            text_encoder_backend=config.text_encoder.get("backend", "hash_ngram"),
+            text_encoder_model_name_or_path=config.text_encoder.get("model_name_or_path", None),
+            freeze_text_encoder=config.text_encoder.get("freeze", False),
+            text_encoder_vocab_size=config.text_encoder.get("vocab_size", 8192),
+            text_encoder_dim=config.text_encoder.get("embedding_dim", 256),
+        )
         self.model.to(device)
         self.model.eval()
 
@@ -30,7 +48,11 @@ class UserInteractiveSegmentationModel(abc.ABC):
             # 3. Extract just the model state_dict
             state_dict = checkpoint["state_dict"]
             # 4. Load the weights - to get the model in the same state as the checkpoint
-            lightning_model.load_state_dict(state_dict, strict=True)
+            missing_keys, unexpected_keys = lightning_model.load_state_dict(state_dict, strict=False)
+            if missing_keys:
+                print(f"Missing Keys: {missing_keys}")
+            if unexpected_keys:
+                print(f"Unexpected Keys: {unexpected_keys}")
             self.model = lightning_model.interactive4d
             self.model.to(device)
             self.model.eval()
