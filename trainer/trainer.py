@@ -134,7 +134,11 @@ class ObjectSegmentation(pl.LightningModule):
         missing_keys, unexpected_keys = self.interactive4d.load_state_dict(interactive_state, strict=False)
         ignored_missing = [key for key in missing_keys if key.startswith("text_encoder") or key == "text_null_embedding"]
         relevant_missing = [key for key in missing_keys if key not in ignored_missing]
-        unexpected_keys = [key for key in unexpected_keys if not key.startswith("text_hash_embedding")]
+        unexpected_keys = [
+            key
+            for key in unexpected_keys
+            if not (key.startswith("text_hash_embedding") or key.startswith("text_encoder"))
+        ]
         if relevant_missing:
             print(f"Missing pretrained Interactive4D keys: {relevant_missing}")
         if unexpected_keys:

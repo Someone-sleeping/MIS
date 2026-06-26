@@ -85,6 +85,7 @@ class TextEncoder(nn.Module):
         super().__init__()
         self.backend = backend
         self.output_dim = output_dim
+        self.freeze = freeze
 
         if backend == "hf_clip":
             try:
@@ -115,7 +116,11 @@ class TextEncoder(nn.Module):
             device = device or next(self.parameters()).device
             encoded = self.tokenizer(text_list, padding=True, truncation=True, return_tensors="pt")
             encoded = {key: value.to(device) for key, value in encoded.items()}
-            output = self.text_model(**encoded)
+            if self.freeze:
+                with torch.no_grad():
+                    output = self.text_model(**encoded)
+            else:
+                output = self.text_model(**encoded)
             pooled = output.pooler_output
             return self.proj(pooled)
         return self.text_model(texts, device=device)

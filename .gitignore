@@ -5,6 +5,7 @@
 *.pcd
 /saved
 /ckpt
+/pretrained
 /logs
 __pycache__/
 /data/
