@@ -97,6 +97,8 @@ class UserInteractiveSegmentationModel(abc.ABC):
 
                 pred_full = pred[self.inverse_map]
                 self.object_mask[:, 0] = pred_full.cpu().numpy()
+                if self.visualizer is not None:
+                    self.visualizer.object_mask = self.object_mask
 
                 if gt_labels is not None:
                     sample_iou, iou_dict = mean_iou_scene(pred_full, gt_labels)
@@ -145,6 +147,8 @@ class UserInteractiveSegmentationModel(abc.ABC):
         self.grey_mask = np.zeros([np.shape(self.original_colors)[0]], dtype=bool)
         self.pc_clicks_idx = []
         self.nc_clicks_idx = []
+        if self.visualizer is not None:
+            self.visualizer.object_mask = self.object_mask
 
     def get_colors(self, reload_masks=False):
         if reload_masks:
@@ -225,6 +229,7 @@ class UserInteractiveSegmentationModel(abc.ABC):
             f.write(line)
 
         self.visualizer = InteractiveSegmentationGUI(self)
+        self.visualizer.object_mask = self.object_mask
         if len(objects) != 0:  # init current object to the first one if there are already objects in the data set
             self.object_name = objects[0]
             colors = self.get_colors(reload_masks=True)

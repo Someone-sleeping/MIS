@@ -4,6 +4,7 @@ import open3d.visualization.rendering as rendering  # type: ignore
 import hashlib
 import os
 import numpy as np
+import re
 import time
 from interactive_tool.utils import get_obj_color, OBJECT_CLICK_COLOR, BACKGROUND_CLICK_COLOR, UNSELECTED_OBJECTS_COLOR, SELECTED_OBJECT_COLOR, find_nearest
 from interactive_tool.text_prompts import parse_text_prompt
@@ -82,6 +83,7 @@ class InteractiveSegmentationGUI:
         self.interactions = {"0": []}
         self.interaction_mode = "click"
         self.pending_interaction = None
+        self.object_mask = None
         self.cur_obj_idx = -1
         self.cur_obj_name = None
 
@@ -316,6 +318,33 @@ class InteractiveSegmentationGUI:
         obj_key = str(obj_id)
         self.interactions.setdefault(obj_key, []).append(token)
 
+    def __ensure_object_state(self, obj_id):
+        obj_key = str(obj_id)
+        self.click_idx.setdefault(obj_key, [])
+        self.click_time_idx.setdefault(obj_key, [])
+        self.click_positions.setdefault(obj_key, [])
+        self.interactions.setdefault(obj_key, [])
+
+    def __prompt_object_id(self):
+        text = self.interaction_text.text_value or ""
+        match = re.search(r"(?:\bobj(?:ect)?\b|\bclass\b|类别|对象)\s*#?\s*(\d+)", text, flags=re.IGNORECASE)
+        if match is None:
+            return None
+        obj_id = int(match.group(1))
+        return obj_id if obj_id > 0 else None
+
+    def __select_text_prompt_object(self):
+        prompt_obj_id = self.__prompt_object_id()
+        if prompt_obj_id is None:
+            return self.objects_widget.current_object_idx
+
+        object_name = f"object {prompt_obj_id}"
+        if object_name in self.objects_widget.objects:
+            self.objects_widget.switch_object(object_name)
+        else:
+            self.objects_widget.create_object(object_name=object_name)
+        return self.objects_widget.current_object_idx
+
     def __build_text_token(self, anchor, extent=None):
         parsed_prompt = parse_text_prompt(self.interaction_text.text_value)
         token_text = parsed_prompt.canonical_text
@@ -341,7 +370,8 @@ class InteractiveSegmentationGUI:
             extent = (points.max(axis=0) - points.min(axis=0)).astype(float).tolist()
             return anchor, extent
 
-        obj_mask = self.object_mask[:, 0] == obj_id if self.object_mask is not None else None
+        object_mask = getattr(self, "object_mask", None)
+        obj_mask = object_mask[:, 0] == obj_id if object_mask is not None else None
         if obj_mask is not None and np.any(obj_mask):
             points = self.coordinates[obj_mask]
             anchor = points.mean(axis=0).astype(float).tolist()
@@ -352,10 +382,11 @@ class InteractiveSegmentationGUI:
         return anchor, [0.0, 0.0, 0.0]
 
     def __add_text_prompt_for_current_object(self):
-        obj_id = self.objects_widget.current_object_idx
+        obj_id = self.__select_text_prompt_object()
         if obj_id is None:
             self.window.show_message_box("Missing Object", "Select or create an object before adding a text prompt.")
             return
+        self.__ensure_object_state(obj_id)
         anchor, extent = self.__object_prompt_geometry(obj_id)
         token = self.__build_text_token(anchor=anchor, extent=extent)
         self.__append_interaction_token(obj_id, token)
@@ -796,6 +827,7 @@ class InteractiveSegmentationGUI:
         self.click_positions = {"0": []}
         self.interactions = {"0": []}
         self.pending_interaction = None
+        self.object_mask = None
 
         self.num_clicks = 0
         self.objects_widget.current_object_idx = None
@@ -863,6 +895,7 @@ class InteractiveSegmentationGUI:
         self.vis_mode_semantics = True
         self.coordinates = coords
         self.coordinates_qv = coords_qv
+        self.object_mask = None
         self.old_colors = colors.copy()
         self.new_colors = colors.copy()
         self.original_colors = original_colors
