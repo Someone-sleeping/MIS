@@ -36,7 +36,8 @@ def _read_annotation_file(path):
     return data[:, :6]
 
 
-def _room_to_arrays(room_dir, max_points):
+def _room_to_arrays(room_dir, max_points, exclude_classes=None):
+    exclude_classes = set(exclude_classes or [])
     annotation_dir = room_dir / "Annotations"
     if not annotation_dir.is_dir():
         raise FileNotFoundError(f"Missing S3DIS Annotations directory: {annotation_dir}")
@@ -45,6 +46,8 @@ def _room_to_arrays(room_dir, max_points):
     instance_id = 1
     for annotation_path in sorted(annotation_dir.glob("*.txt")):
         class_name = annotation_path.stem.split("_")[0]
+        if class_name in exclude_classes:
+            continue
         class_id = S3DIS_CLASS_IDS.get(class_name, S3DIS_CLASS_IDS["clutter"])
         data = _read_annotation_file(annotation_path)
         if data.size == 0:
@@ -86,6 +89,7 @@ def main():
     parser.add_argument("--room", default=None, help="Room name such as office_1. Defaults to the first room in the area.")
     parser.add_argument("--output_dir", default="interactive_scenes_s3dis")
     parser.add_argument("--max_points", type=int, default=60000, help="0 keeps all room points")
+    parser.add_argument("--exclude_classes", nargs="*", default=[], help="S3DIS classes to remove, e.g. ceiling")
     args = parser.parse_args()
 
     s3dis_root = Path(args.s3dis_root)
@@ -99,7 +103,11 @@ def main():
         room = args.room
 
     room_dir = area_dir / room
-    coords, colors, time, intensity, distance, semantic_labels, instance_labels = _room_to_arrays(room_dir, args.max_points)
+    coords, colors, time, intensity, distance, semantic_labels, instance_labels = _room_to_arrays(
+        room_dir,
+        args.max_points,
+        exclude_classes=args.exclude_classes,
+    )
 
     scene_name = f"scene_{args.area}_{room}"
     scene_dir = Path(args.output_dir) / scene_name
@@ -110,7 +118,8 @@ def main():
         [coords, colors, time, intensity, distance, semantic_labels, instance_labels],
         ["x", "y", "z", "red", "green", "blue", "time", "intensity", "distance", "semantic_label", "label"],
     )
-    print(f"Wrote {output_path} with {coords.shape[0]} points from {room_dir}")
+    excluded = ", ".join(args.exclude_classes) if args.exclude_classes else "none"
+    print(f"Wrote {output_path} with {coords.shape[0]} points from {room_dir}; excluded classes: {excluded}")
 
 
 if __name__ == "__main__":
