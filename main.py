@@ -165,6 +165,10 @@ def main():
     parser.add_argument("--num_sweeps", type=int, help="Specify the number of sweeps")
     parser.add_argument("--ckpt_path", type=str, help="Resume full Lightning training state from a checkpoint")
     parser.add_argument("--init_from_ckpt", type=str, help="Initialize model weights from a checkpoint without resuming optimizer state")
+    parser.add_argument("--supervision", type=str, choices=["supervised", "growsp_pseudo"], help="Training supervision source")
+    parser.add_argument("--growsp_backbone_ckpt", type=str, help="Optionally initialize matching backbone weights from a GrowSP model checkpoint")
+    parser.add_argument("--growsp_pseudo_label_dir", type=str, help="Directory containing GrowSP pseudo label .npy files")
+    parser.add_argument("--growsp_data_dir", type=str, help="Directory containing GrowSP prepared S3DIS .ply files")
     args = parser.parse_args()
 
     # Load configuration
@@ -192,6 +196,18 @@ def main():
         cfg.general.ckpt_path = args.ckpt_path
         cfg.general.init_from_ckpt = None
         print(f"Resuming training from {cfg.general.ckpt_path}")
+    if args.supervision is not None:
+        cfg.general.supervision = args.supervision
+        print(f"Training supervision changed to {cfg.general.supervision}")
+    if args.growsp_backbone_ckpt is not None:
+        cfg.model.growsp_backbone_ckpt = args.growsp_backbone_ckpt
+        print(f"GrowSP backbone initialization checkpoint: {cfg.model.growsp_backbone_ckpt}")
+    if args.growsp_pseudo_label_dir is not None:
+        cfg.data.datasets.growsp_pseudo_label_dir = args.growsp_pseudo_label_dir
+        print(f"GrowSP pseudo label directory: {cfg.data.datasets.growsp_pseudo_label_dir}")
+    if args.growsp_data_dir is not None:
+        cfg.data.datasets.growsp_data_dir = args.growsp_data_dir
+        print(f"GrowSP data directory: {cfg.data.datasets.growsp_data_dir}")
 
     # Execute based on mode
     if mode == "train":

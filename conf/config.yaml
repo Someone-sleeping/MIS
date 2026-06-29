@@ -6,6 +6,7 @@ general:
   gpus: null
   seed: 42
   dataset: s3dis # Options: semantickitti, nuScenes_general, nuScenes_challenge, kitti360, s3dis
+  supervision: supervised # Options: supervised, growsp_pseudo
   rank_error_strategy: "SI" # Options: SI, BD.
   initial_clicking_strategy: "centroid" # Options: centroid, random, boundary_dependent, dbscan.
   refinement_clicking_strategy: "random" # Options: centroid, random, boundary_dependent, dbscan.
@@ -54,6 +55,10 @@ data:
   datasets:
     data_dir: datasets/jsons/
     s3dis_raw_dir: data/S3DIS/Stanford3dDataset_v1.2
+    growsp_data_dir: /home/magic/magic/cm/codex/GrowSP/data/S3DIS/input
+    growsp_pseudo_label_dir: /home/magic/magic/cm/codex/GrowSP/ckpt/S3DIS/pseudo_t1260
+    growsp_voxel_size: 0.05
+    growsp_clip_bound: 4.0
     s3dis_validation_area: Area_5
     s3dis_max_points_per_room: 9000
     add_distance: true
@@ -70,6 +75,10 @@ data:
 
 optimizer:
   lr: 0.0002
+
+model:
+  growsp_backbone_ckpt: null
+  adapt_growsp_input: true
 
 interactions:
   enabled: true

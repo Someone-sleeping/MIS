@@ -23,6 +23,7 @@ from datasets.lidar_semantickitti import SemanticKittiDataset
 from datasets.lidar_nuscenes import NuscenesDataset
 from datasets.lidar_kitti360 import Kitti360Dataset
 from datasets.lidar_s3dis import S3DISDataset
+from datasets.lidar_s3dis_growsp import GrowSPPseudoS3DISDataset
 from models import Interactive4D
 from models.criterion import SetCriterion
 from models.metrics.utils import IoU_at_numClicks, NumClicks_for_IoU, NumClicks_for_IoU_class, mIoU_per_class_metric, mIoU_metric, losses_metric
@@ -118,7 +119,52 @@ class ObjectSegmentation(pl.LightningModule):
         warnings.filterwarnings("ignore", message=".*but the value needs to be floating point.*")
 
         self.save_hyperparameters()
+        self.initialize_growsp_backbone()
         self.initialize_from_checkpoint()
+
+    def initialize_growsp_backbone(self):
+        ckpt_path = self.config.get("model", {}).get("growsp_backbone_ckpt", None)
+        if not ckpt_path:
+            return
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        state_dict = checkpoint["state_dict"] if isinstance(checkpoint, dict) and "state_dict" in checkpoint else checkpoint
+        target_state = self.interactive4d.backbone.state_dict()
+        load_state = {}
+        adapted = []
+        skipped = []
+        for key, value in state_dict.items():
+            clean_key = key
+            for prefix in ("module.", "model.", "backbone."):
+                if clean_key.startswith(prefix):
+                    clean_key = clean_key[len(prefix):]
+            if clean_key not in target_state:
+                skipped.append(clean_key)
+                continue
+            target_value = target_state[clean_key]
+            if value.shape == target_value.shape:
+                load_state[clean_key] = value
+            elif (
+                self.config.get("model", {}).get("adapt_growsp_input", True)
+                and clean_key == "conv0p1s1.kernel"
+                and value.ndim == 3
+                and target_value.ndim == 3
+                and value.shape[0] == target_value.shape[0]
+                and value.shape[2] == target_value.shape[2]
+                and value.shape[1] >= target_value.shape[1]
+                and target_value.shape[1] == 2
+            ):
+                adapted_value = torch.empty_like(target_value)
+                adapted_value[:, 0, :] = value[:, :3, :].mean(dim=1)
+                adapted_value[:, 1, :] = value[:, 3:, :].mean(dim=1)
+                load_state[clean_key] = adapted_value
+                adapted.append(clean_key)
+            else:
+                skipped.append(clean_key)
+        missing, unexpected = self.interactive4d.backbone.load_state_dict(load_state, strict=False)
+        print(
+            f"Initialized Interactive4D backbone from GrowSP checkpoint {ckpt_path}: "
+            f"loaded={len(load_state)}, adapted={adapted}, missing={len(missing)}, skipped={len(skipped)}, unexpected={len(unexpected)}"
+        )
 
     def initialize_from_checkpoint(self):
         init_from_ckpt = self.config.general.get("init_from_ckpt", None)
@@ -146,7 +192,20 @@ class ObjectSegmentation(pl.LightningModule):
         print(f"Initialized Interactive4D weights from {init_from_ckpt}")
 
     def setup(self, stage):
-        if self.config.general.dataset == "s3dis":
+        if self.config.general.dataset == "s3dis" and self.config.general.get("supervision", "supervised") == "growsp_pseudo":
+            self.train_dataset = GrowSPPseudoS3DISDataset(
+                growsp_data_dir=self.config.data.datasets.growsp_data_dir,
+                pseudo_label_dir=self.config.data.datasets.growsp_pseudo_label_dir,
+                sweep=self.config.data.datasets.sweep,
+                volume_augmentations_path=self.config.data.datasets.volume_augmentations_path,
+                mode="train",
+                center_coordinates=self.config.data.datasets.center_coordinates,
+                validation_area=self.config.data.datasets.s3dis_validation_area,
+                max_points_per_room=self.config.data.datasets.s3dis_max_points_per_room,
+                growsp_voxel_size=self.config.data.datasets.get("growsp_voxel_size", 0.05),
+                clip_bound=self.config.data.datasets.get("growsp_clip_bound", 4.0),
+            )
+        elif self.config.general.dataset == "s3dis":
             self.train_dataset = S3DISDataset(
                 data_dir=self.config.data.datasets.s3dis_raw_dir,
                 sweep=self.config.data.datasets.sweep,
@@ -1072,6 +1131,8 @@ class ObjectSegmentation(pl.LightningModule):
         return sample_interactions
 
     def get_interaction_class_name(self, sample_obj2label, obj_id):
+        if self.config.general.get("supervision", "supervised") == "growsp_pseudo":
+            return "object"
         if sample_obj2label is None or obj_id not in sample_obj2label:
             return "object"
 
